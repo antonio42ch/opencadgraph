@@ -1,10 +1,13 @@
 //! Port values.
 //!
-//! A value is plain JSON: numbers, text, booleans, `null`, lists (arrays) and
-//! points (`{"x", "y", "z"}` objects). Object ports carry whatever the host
-//! puts there. Every node reads its inputs through the lenient coercions
-//! below, so a property shown as text (`"10.0000"`) feeds a number input.
+//! A value is plain JSON: numbers, text, booleans, `null`, lists (arrays),
+//! points (`{"x", "y", "z"}` objects) and curves (see [`curve`]). Object
+//! ports carry whatever the host puts there. Every node reads its inputs
+//! through the lenient coercions below, so a property shown as text
+//! (`"10.0000"`) feeds a number input.
 
+use kernel::geom2d::polyline::{Polyline, PolylineVertex};
+use kernel::space::{PlanarCurve, Plane};
 use serde_json::{json, Value};
 
 /// A number, from a number, a numeric string or a boolean.
@@ -105,4 +108,170 @@ pub fn lace(
         }
     }
     columns.into_iter().map(Value::Array).collect()
+}
+
+/// A curve value: `{"curve": kind, …}` with its shape in plane coordinates
+/// and an optional `plane` (`{"origin", "x_axis", "y_axis"}`, each `[x, y,
+/// z]`; the world XY plane when absent). Kinds and their fields, angles in
+/// degrees:
+///
+/// - `line`: `start`, `end` (`[x, y]`)
+/// - `circle`: `center`, `radius`
+/// - `arc`: `center`, `radius`, `from`, `to` (counter-clockwise)
+/// - `polyline`: `points`, optional `bulges` (one per point), `closed`
+/// - `ray`: `origin`, `direction`; `xline`: `base`, `direction`
+///
+/// Graph nodes make and transform curves as values like this; only a node
+/// that draws them puts them in the drawing.
+pub fn curve(value: &Value) -> Option<PlanarCurve> {
+    use kernel::geom2d::{Arc, Circle, Curve, Line, Ray, XLine};
+    let object = value.as_object()?;
+    let pair = |key: &str| -> Option<[f64; 2]> {
+        let items = object.get(key)?.as_array()?;
+        Some([num(items.first()?)?, num(items.get(1)?)?])
+    };
+    let scalar = |key: &str| object.get(key).and_then(num);
+    let shape = match object.get("curve")?.as_str()? {
+        "line" => Curve::Line(Line {
+            start: pair("start")?,
+            end: pair("end")?,
+        }),
+        "circle" => Curve::Circle(Circle {
+            centre: pair("center")?,
+            radius: scalar("radius").filter(|r| *r > 0.0)?,
+        }),
+        "arc" => Curve::Arc(Arc {
+            centre: pair("center")?,
+            radius: scalar("radius").filter(|r| *r > 0.0)?,
+            start_angle: scalar("from")?.to_radians(),
+            end_angle: scalar("to")?.to_radians(),
+        }),
+        "polyline" => {
+            let points = object.get("points")?.as_array()?;
+            let bulges = object.get("bulges").and_then(Value::as_array);
+            let vertices = points
+                .iter()
+                .enumerate()
+                .map(|(k, point)| {
+                    let items = point.as_array()?;
+                    Some(PolylineVertex {
+                        position: [num(items.first()?)?, num(items.get(1)?)?],
+                        bulge: bulges
+                            .and_then(|bulges| bulges.get(k))
+                            .and_then(num)
+                            .unwrap_or(0.0),
+                    })
+                })
+                .collect::<Option<Vec<_>>>()?;
+            if vertices.len() < 2 {
+                return None;
+            }
+            Curve::Polyline(Polyline {
+                vertices,
+                closed: object.get("closed").and_then(boolean).unwrap_or(false),
+            })
+        }
+        "ray" => Curve::Ray(Ray {
+            origin: pair("origin")?,
+            direction: pair("direction")?,
+        }),
+        "xline" => Curve::XLine(XLine {
+            base: pair("base")?,
+            direction: pair("direction")?,
+        }),
+        _ => return None,
+    };
+    let plane = match object.get("plane") {
+        Some(plane) => {
+            let axis = |key: &str| -> Option<[f64; 3]> {
+                let items = plane.get(key)?.as_array()?;
+                Some([num(items.first()?)?, num(items.get(1)?)?, num(items.get(2)?)?])
+            };
+            Plane {
+                origin: axis("origin")?,
+                x_axis: axis("x_axis")?,
+                y_axis: axis("y_axis")?,
+            }
+        }
+        None => Plane::XY,
+    };
+    Some(PlanarCurve::new(plane, shape))
+}
+
+/// The value of `curve`, as [`curve`] reads it; `None` for ellipses and
+/// splines, which have no value form yet.
+pub fn curve_value(curve: &PlanarCurve) -> Option<Value> {
+    use kernel::geom2d::Curve;
+    let pair = |p: [f64; 2]| json!([number(p[0]), number(p[1])]);
+    let mut value = match &curve.curve {
+        Curve::Line(line) => json!({ "curve": "line", "start": pair(line.start), "end": pair(line.end) }),
+        Curve::Circle(circle) => json!({
+            "curve": "circle",
+            "center": pair(circle.centre),
+            "radius": number(circle.radius),
+        }),
+        Curve::Arc(arc) => json!({
+            "curve": "arc",
+            "center": pair(arc.centre),
+            "radius": number(arc.radius),
+            "from": number(arc.start_angle.to_degrees()),
+            "to": number(arc.end_angle.to_degrees()),
+        }),
+        Curve::Polyline(polyline) => {
+            let mut value = json!({
+                "curve": "polyline",
+                "points": polyline.vertices.iter().map(|v| pair(v.position)).collect::<Vec<_>>(),
+                "closed": polyline.closed,
+            });
+            if polyline.vertices.iter().any(|v| v.bulge != 0.0) {
+                value["bulges"] =
+                    json!(polyline.vertices.iter().map(|v| number(v.bulge)).collect::<Vec<_>>());
+            }
+            value
+        }
+        Curve::Ray(ray) => json!({ "curve": "ray", "origin": pair(ray.origin), "direction": pair(ray.direction) }),
+        Curve::XLine(line) => json!({ "curve": "xline", "base": pair(line.base), "direction": pair(line.direction) }),
+        Curve::Ellipse(_) | Curve::Nurbs(_) => return None,
+    };
+    if curve.plane != Plane::XY {
+        let triple = |p: [f64; 3]| json!([number(p[0]), number(p[1]), number(p[2])]);
+        value["plane"] = json!({
+            "origin": triple(curve.plane.origin),
+            "x_axis": triple(curve.plane.x_axis),
+            "y_axis": triple(curve.plane.y_axis),
+        });
+    }
+    Some(value)
+}
+
+/// The plane parallel to world XY through height `z`, which curves built
+/// from points lie on.
+pub fn plane_at(z: f64) -> Plane {
+    Plane {
+        origin: [0.0, 0.0, z],
+        ..Plane::XY
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn curves_round_trip_through_their_values() {
+        for value in [
+            json!({"curve":"line","start":[0.0,0.0],"end":[10.0,0.0]}),
+            json!({"curve":"circle","center":[1.0,2.0],"radius":3.0}),
+            json!({"curve":"arc","center":[0.0,0.0],"radius":2.0,"from":0.0,"to":90.0}),
+            json!({"curve":"polyline","points":[[0.0,0.0],[5.0,0.0],[5.0,5.0]],"closed":true}),
+            json!({"curve":"line","start":[0.0,0.0],"end":[1.0,0.0],"plane":{"origin":[0.0,0.0,4.0],"x_axis":[1.0,0.0,0.0],"y_axis":[0.0,1.0,0.0]}}),
+        ] {
+            let curve = curve(&value).unwrap_or_else(|| panic!("{value}"));
+            assert_eq!(curve_value(&curve).unwrap(), value);
+        }
+        let arc = curve(&json!({"curve":"arc","center":[0,0],"radius":2,"from":0,"to":90})).unwrap();
+        assert!((arc.length() - std::f64::consts::PI).abs() < 1e-9);
+        assert!(curve(&json!({"curve":"circle","center":[0,0],"radius":-1})).is_none());
+        assert!(curve(&json!({"x":1,"y":2})).is_none());
+    }
 }

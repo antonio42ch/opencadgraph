@@ -10,7 +10,9 @@ use std::cmp::Ordering;
 use kernel::geom2d::{cross, Tolerance};
 use serde_json::Value;
 
-use crate::value::{boolean, list, num, number, point, point_value, text};
+use crate::value::{
+    boolean, curve, curve_value, list, num, number, plane_at, point, point_value, text,
+};
 use crate::Host;
 
 /// An input's value while nothing is linked to it.
@@ -55,7 +57,7 @@ impl std::fmt::Debug for Spec {
     }
 }
 
-pub const CATEGORIES: &[&str] = &["Input", "Math", "Logic", "List", "Text", "Geometry"];
+pub const CATEGORIES: &[&str] = &["Input", "Math", "Logic", "List", "Text", "Geometry", "Curve"];
 
 /// The spec called `name`.
 pub fn spec(name: &str) -> Option<&'static Spec> {
@@ -186,6 +188,51 @@ fn substitute(expression: &str, values: &[Value]) -> String {
     }
     flush(&mut word, &mut result);
     result
+}
+
+/// The curve a value stands for: a curve value, or whatever the host
+/// resolves (a drawn object).
+fn curve_of(value: &Value, host: &dyn Host) -> Option<kernel::space::PlanarCurve> {
+    curve(value).or_else(|| host.curve(value))
+}
+
+/// A curve on the XY plane through height `z`, as a value.
+fn flat_curve(z: f64, shape: kernel::geom2d::Curve) -> Value {
+    curve_value(&kernel::space::PlanarCurve::new(plane_at(z), shape)).unwrap_or(Value::Null)
+}
+
+/// The parallel of `curve` at `distance`, positive to the left of its
+/// direction; a polyline may come apart into several pieces.
+fn offset(curve: &kernel::space::PlanarCurve, distance: f64) -> Value {
+    use kernel::geom2d::Curve;
+    let value = |shape: Curve| {
+        curve_value(&kernel::space::PlanarCurve::new(curve.plane, shape)).unwrap_or(Value::Null)
+    };
+    match &curve.curve {
+        Curve::Polyline(polyline) => {
+            let [a, b] = [0, 1].map(|k| polyline.vertices[k % polyline.vertices.len()].position);
+            let along = [b[0] - a[0], b[1] - a[1]];
+            let length = along[0].hypot(along[1]);
+            if length == 0.0 || distance == 0.0 {
+                return Value::Null;
+            }
+            // A point on the wanted side of the first segment's middle.
+            let side = [
+                (a[0] + b[0]) / 2.0 - along[1] / length * distance,
+                (a[1] + b[1]) / 2.0 + along[0] / length * distance,
+            ];
+            let mut pieces: Vec<Value> = kernel::geom2d::offset_polyline(polyline, distance, side)
+                .into_iter()
+                .map(|piece| value(Curve::Polyline(piece)))
+                .collect();
+            match pieces.len() {
+                0 => Value::Null,
+                1 => pieces.remove(0),
+                _ => Value::Array(pieces),
+            }
+        }
+        shape => kernel::geom2d::offset_curve(shape, distance, 1e-6).map_or(Value::Null, value),
+    }
 }
 
 fn same_plane(a: &kernel::space::Plane, b: &kernel::space::Plane) -> bool {
@@ -499,32 +546,32 @@ pub const LIBRARY: &[Spec] = &[
             None => out(Value::Null),
         } },
     Spec { name: "Curve Length", category: "Geometry", inputs: CURVE, outputs: RESULT,
-        eval: |a, host| out(host.curve(&a[0]).map_or(Value::Null, |c| number(c.length()))) },
+        eval: |a, host| out(curve_of(&a[0], host).map_or(Value::Null, |c| number(c.length()))) },
     Spec { name: "Curve Area", category: "Geometry", inputs: CURVE, outputs: RESULT,
-        eval: |a, host| out(host.curve(&a[0]).map_or(Value::Null, |c| number(c.curve.enclosed_area().abs()))) },
+        eval: |a, host| out(curve_of(&a[0], host).map_or(Value::Null, |c| number(c.curve.enclosed_area().abs()))) },
     Spec { name: "Curve Endpoints", category: "Geometry", inputs: CURVE, outputs: &["start", "end"],
-        eval: |a, host| match host.curve(&a[0]) {
+        eval: |a, host| match curve_of(&a[0], host) {
             Some(c) => vec![point_value(c.point_at(0.0)), point_value(c.point_at(1.0))],
             None => vec![Value::Null; 2],
         } },
     Spec { name: "Point At Parameter", category: "Geometry", inputs: &[v("curve"), n("t", 0.5)], outputs: POINT,
-        eval: |a, host| out(match (host.curve(&a[0]), num(&a[1])) {
+        eval: |a, host| out(match (curve_of(&a[0], host), num(&a[1])) {
             (Some(c), Some(t)) => point_value(c.point_at(t)),
             _ => Value::Null,
         }) },
     Spec { name: "Point At Distance", category: "Geometry", inputs: &[v("curve"), n("distance", 0.0)],
         outputs: POINT,
-        eval: |a, host| out(match (host.curve(&a[0]), num(&a[1])) {
+        eval: |a, host| out(match (curve_of(&a[0], host), num(&a[1])) {
             (Some(c), Some(d)) => point_value(c.point_at_distance(d)),
             _ => Value::Null,
         }) },
     Spec { name: "Parameter At Point", category: "Geometry", inputs: &[v("curve"), v("point")], outputs: &["t"],
-        eval: |a, host| out(match (host.curve(&a[0]), point(&a[1])) {
+        eval: |a, host| out(match (curve_of(&a[0], host), point(&a[1])) {
             (Some(c), Some(p)) => c.parameter_at(p).map_or(Value::Null, number),
             _ => Value::Null,
         }) },
     Spec { name: "Divide Curve", category: "Geometry", inputs: &[v("curve"), n("count", 10.0)], outputs: &["points"],
-        eval: |a, host| out(match (host.curve(&a[0]), num(&a[1])) {
+        eval: |a, host| out(match (curve_of(&a[0], host), num(&a[1])) {
             (Some(c), Some(count)) if count >= 1.0 => {
                 let (count, length) = ((count as usize).min(MAX_ITEMS), c.length());
                 Value::Array((0..=count).map(|k| point_value(c.point_at_distance(length * k as f64 / count as f64))).collect())
@@ -532,7 +579,7 @@ pub const LIBRARY: &[Spec] = &[
             _ => Value::Null,
         }) },
     Spec { name: "Intersect", category: "Geometry", inputs: &[v("a"), v("b")], outputs: &["points"],
-        eval: |a, host| out(match (host.curve(&a[0]), host.curve(&a[1])) {
+        eval: |a, host| out(match (curve_of(&a[0], host), curve_of(&a[1], host)) {
             // Curves on different planes meet at most in isolated points the
             // plane-curve intersection cannot see; they report none.
             (Some(p), Some(q)) if same_plane(&p.plane, &q.plane) => Value::Array(
@@ -543,4 +590,128 @@ pub const LIBRARY: &[Spec] = &[
             ),
             _ => Value::Array(Vec::new()),
         }) },
+    // ── Curve ────────────────────────────────────────────────────────────
+    // Curves made here are values: they flow to other nodes and only reach
+    // the drawing through a node that draws them.
+    Spec { name: "Line Curve", category: "Curve", inputs: &[v("start"), v("end")], outputs: &["curve"],
+        eval: |a, _| out(match (point(&a[0]), point(&a[1])) {
+            (Some(p), Some(q)) => flat_curve(p[2], kernel::geom2d::Curve::Line(kernel::geom2d::Line {
+                start: [p[0], p[1]],
+                end: [q[0], q[1]],
+            })),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Circle Curve", category: "Curve", inputs: &[v("center"), n("radius", 1.0)], outputs: &["curve"],
+        eval: |a, _| out(match (point(&a[0]), num(&a[1])) {
+            (Some(c), Some(r)) if r > 0.0 => flat_curve(c[2], kernel::geom2d::Curve::Circle(kernel::geom2d::Circle {
+                centre: [c[0], c[1]],
+                radius: r,
+            })),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Arc Curve", category: "Curve",
+        inputs: &[v("center"), n("radius", 1.0), n("from", 0.0), n("to", 90.0)], outputs: &["curve"],
+        eval: |a, _| out(match (point(&a[0]), num(&a[1]), num(&a[2]), num(&a[3])) {
+            (Some(c), Some(r), Some(from), Some(to)) if r > 0.0 => flat_curve(c[2], kernel::geom2d::Curve::Arc(kernel::geom2d::Arc {
+                centre: [c[0], c[1]],
+                radius: r,
+                start_angle: from.to_radians(),
+                end_angle: to.to_radians(),
+            })),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Polyline Curve", category: "Curve", inputs: &[l("points"), b("closed", false)], outputs: &["curve"],
+        eval: |a, _| {
+            let points: Vec<[f64; 3]> = list(&a[0]).iter().filter_map(point).collect();
+            out(if points.len() < 2 {
+                Value::Null
+            } else {
+                flat_curve(points[0][2], kernel::geom2d::Curve::Polyline(kernel::geom2d::polyline::Polyline {
+                    vertices: points
+                        .iter()
+                        .map(|p| kernel::geom2d::polyline::PolylineVertex::straight([p[0], p[1]]))
+                        .collect(),
+                    closed: boolean(&a[1]).unwrap_or(false),
+                }))
+            })
+        } },
+    Spec { name: "Offset Curve", category: "Curve", inputs: &[v("curve"), n("distance", 1.0)], outputs: &["curve"],
+        eval: |a, host| out(match (curve_of(&a[0], host), num(&a[1])) {
+            (Some(c), Some(d)) => offset(&c, d),
+            _ => Value::Null,
+        }) },
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// A host with no drawing: every curve must come from a value.
+    struct NoDrawing;
+
+    impl Host for NoDrawing {
+        fn objects(
+            &mut self,
+            _: crate::NodeId,
+            _: &str,
+            _: &[Vec<(String, Value)>],
+        ) -> Vec<Vec<(String, Value)>> {
+            Vec::new()
+        }
+        fn curve(&self, _: &Value) -> Option<kernel::space::PlanarCurve> {
+            None
+        }
+        fn expression(&self, _: &str) -> Option<f64> {
+            None
+        }
+    }
+
+    fn run(name: &str, args: &[Value]) -> Vec<Value> {
+        (spec(name).unwrap().eval)(args, &NoDrawing)
+    }
+
+    fn p(x: f64, y: f64) -> Value {
+        point_value([x, y, 0.0])
+    }
+
+    #[test]
+    fn curves_made_as_values_feed_the_curve_operations() {
+        let line = run("Line Curve", &[p(0.0, 0.0), p(3.0, 4.0)]).remove(0);
+        assert_eq!(line["curve"], "line");
+        assert_eq!(run("Curve Length", &[line.clone()])[0], json!(5.0));
+        let ends = run("Curve Endpoints", &[line]);
+        assert_eq!(point(&ends[1]), Some([3.0, 4.0, 0.0]));
+
+        let circle = run("Circle Curve", &[p(0.0, 0.0), json!(2.0)]).remove(0);
+        let area = num(&run("Curve Area", &[circle])[0]).unwrap();
+        assert!((area - 4.0 * std::f64::consts::PI).abs() < 1e-9);
+        assert_eq!(run("Circle Curve", &[p(0.0, 0.0), json!(0.0)])[0], Value::Null);
+    }
+
+    #[test]
+    fn offsets_go_left_for_positive_distances() {
+        let line = run("Line Curve", &[p(0.0, 0.0), p(10.0, 0.0)]).remove(0);
+        let left = run("Offset Curve", &[line.clone(), json!(2.0)]).remove(0);
+        assert_eq!(left["start"], json!([0.0, 2.0]));
+        let right = run("Offset Curve", &[line, json!(-2.0)]).remove(0);
+        assert_eq!(right["end"], json!([10.0, -2.0]));
+
+        // A counter-clockwise square grows outward to the right of travel.
+        let square = run(
+            "Polyline Curve",
+            &[json!([p(0.0, 0.0), p(10.0, 0.0), p(10.0, 10.0), p(0.0, 10.0)]), json!(true)],
+        )
+        .remove(0);
+        let outer = run("Offset Curve", &[square.clone(), json!(-1.0)]).remove(0);
+        let inner = run("Offset Curve", &[square, json!(1.0)]).remove(0);
+        let area = |value: &Value| num(&run("Curve Area", &[value.clone()])[0]).unwrap();
+        assert!(area(&outer) > 100.0 && area(&inner) < 100.0, "{outer} {inner}");
+        assert!((area(&inner) - 64.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn a_polyline_needs_two_points() {
+        assert_eq!(run("Polyline Curve", &[json!([p(0.0, 0.0)]), json!(false)])[0], Value::Null);
+    }
+}
