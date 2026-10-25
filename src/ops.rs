@@ -474,6 +474,74 @@ pub const LIBRARY: &[Spec] = &[
             let width = rows.iter().map(Vec::len).min().unwrap_or(0);
             out(Value::Array((0..width).map(|k| Value::Array(rows.iter().map(|row| row[k].clone()).collect())).collect()))
         } },
+    // Nested lists are the graph's trees: these reshape them.
+    Spec { name: "Graft", category: "List", inputs: LIST, outputs: &["list"],
+        eval: |a, _| out(Value::Array(list(&a[0]).into_iter().map(|item| Value::Array(vec![item])).collect())) },
+    Spec { name: "Flatten Once", category: "List", inputs: LIST, outputs: &["list"],
+        eval: |a, _| out(Value::Array(list(&a[0]).into_iter().flat_map(|item| list(&item)).collect())) },
+    Spec { name: "List Depth", category: "List", inputs: LIST, outputs: &["depth"],
+        eval: |a, _| {
+            fn depth(value: &Value) -> usize {
+                match value {
+                    Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+                    _ => 0,
+                }
+            }
+            out(number(depth(&a[0]) as f64))
+        } },
+    Spec { name: "Cross Reference", category: "List", inputs: &[l("a"), l("b")], outputs: &["a", "b"],
+        eval: |a, _| {
+            let (xs, ys) = (list(&a[0]), list(&a[1]));
+            let pairs = xs.len().saturating_mul(ys.len()).min(MAX_ITEMS);
+            let (mut left, mut right) = (Vec::with_capacity(pairs), Vec::with_capacity(pairs));
+            'all: for x in &xs {
+                for y in &ys {
+                    if left.len() == pairs {
+                        break 'all;
+                    }
+                    left.push(x.clone());
+                    right.push(y.clone());
+                }
+            }
+            vec![Value::Array(left), Value::Array(right)]
+        } },
+    Spec { name: "Weave", category: "List", inputs: &[l("a"), l("b")], outputs: &["list"],
+        eval: |a, _| {
+            let (xs, ys) = (list(&a[0]), list(&a[1]));
+            let mut woven = Vec::with_capacity(xs.len() + ys.len());
+            for k in 0..xs.len().max(ys.len()) {
+                woven.extend(xs.get(k).cloned());
+                woven.extend(ys.get(k).cloned());
+            }
+            out(Value::Array(woven))
+        } },
+    Spec { name: "Shift List", category: "List", inputs: &[l("list"), n("offset", 1.0), b("wrap", true)],
+        outputs: &["list"],
+        eval: |a, _| {
+            let items = list(&a[0]);
+            let len = items.len() as i64;
+            let offset = num(&a[1]).unwrap_or(0.0) as i64;
+            if len == 0 {
+                return out(Value::Array(items));
+            }
+            out(Value::Array(if boolean(&a[2]).unwrap_or(true) {
+                (0..len).map(|k| items[(k + offset).rem_euclid(len) as usize].clone()).collect()
+            } else {
+                (0..len).filter_map(|k| items.get((k + offset) as usize).filter(|_| k + offset >= 0).cloned()).collect()
+            }))
+        } },
+    Spec { name: "Cull Pattern", category: "List", inputs: &[l("list"), l("pattern")], outputs: &["list"],
+        eval: |a, _| {
+            let pattern: Vec<bool> = list(&a[1]).iter().map(|keep| boolean(keep).unwrap_or(false)).collect();
+            out(if pattern.is_empty() {
+                a[0].clone()
+            } else {
+                Value::Array(list(&a[0]).into_iter().enumerate()
+                    .filter(|(k, _)| pattern[k % pattern.len()])
+                    .map(|(_, item)| item)
+                    .collect())
+            })
+        } },
     // ── Text ─────────────────────────────────────────────────────────────
     Spec { name: "Concatenate", category: "Text", inputs: &[s("a", ""), s("b", "")], outputs: RESULT,
         eval: |a, _| out(Value::String(text(&a[0]) + &text(&a[1]))) },
@@ -1023,5 +1091,20 @@ mod tests {
         assert_eq!(pieces.as_array().map(Vec::len), Some(3));
         let round = run("Fillet Corners", &[joined[0].clone(), json!(0.5)]).remove(0);
         assert!(length_of(&round) < length_of(&joined[0]));
+    }
+
+    #[test]
+    fn nested_lists_reshape() {
+        let items = json!([1, 2, 3]);
+        assert_eq!(run("Graft", &[items.clone()])[0], json!([[1], [2], [3]]));
+        assert_eq!(run("Flatten Once", &[json!([[1, [2]], [3]])])[0], json!([1, [2], 3]));
+        assert_eq!(run("List Depth", &[json!([[1], [2, [3]]])])[0], json!(3.0));
+        let crossed = run("Cross Reference", &[json!(["a", "b"]), json!([1, 2])]);
+        assert_eq!(crossed[0], json!(["a", "a", "b", "b"]));
+        assert_eq!(crossed[1], json!([1, 2, 1, 2]));
+        assert_eq!(run("Weave", &[json!([1, 3, 5]), json!([2, 4])])[0], json!([1, 2, 3, 4, 5]));
+        assert_eq!(run("Shift List", &[items.clone(), json!(1), json!(true)])[0], json!([2, 3, 1]));
+        assert_eq!(run("Shift List", &[items.clone(), json!(1), json!(false)])[0], json!([2, 3]));
+        assert_eq!(run("Cull Pattern", &[json!([1, 2, 3, 4]), json!([true, false])])[0], json!([1, 3]));
     }
 }

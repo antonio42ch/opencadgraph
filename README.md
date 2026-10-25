@@ -3,7 +3,8 @@
 A node graph engine for CAD applications.
 
 Nodes are library operations (input, math, logic, list, text, geometry,
-vector, curve, transform) or
+vector, curve, transform), composites — a graph of operations used as one
+node, built with `Graph::extract` and opened again with `Graph::expand` — or
 host objects — drawing objects whose property rows are the node's ports. The
 engine owns ordering, list lacing and value coercion; the application
 implements [`Host`](src/lib.rs) to create, edit and read its objects and to

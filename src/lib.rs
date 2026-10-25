@@ -6,6 +6,7 @@
 //! the [`Host`] to create, edit and read objects. It has no user interface
 //! and no document model of its own.
 
+pub mod composite;
 pub mod geometry;
 pub mod ops;
 pub mod value;
@@ -15,6 +16,7 @@ use std::collections::BTreeMap;
 use kernel::space::PlanarCurve;
 use serde_json::{json, Value};
 
+pub use composite::Composite;
 pub use ops::{spec, Spec, CATEGORIES, LIBRARY};
 
 pub type NodeId = u32;
@@ -54,6 +56,8 @@ pub enum Kind {
     Op(&'static Spec),
     /// A host object type, e.g. `"Line"`.
     Object(String),
+    /// A graph of operations used as one node.
+    Composite(std::sync::Arc<Composite>),
 }
 
 #[derive(Clone, Debug)]
@@ -83,6 +87,7 @@ impl Graph {
                 .map(|input| (input.name.to_owned(), input.default.value()))
                 .collect(),
             Kind::Object(_) => BTreeMap::new(),
+            Kind::Composite(composite) => composite.defaults(),
         };
         self.nodes.push(Node {
             id: self.next_id,
@@ -200,6 +205,7 @@ impl Graph {
                 "kind": match &node.kind {
                     Kind::Op(spec) => json!({ "op": spec.name }),
                     Kind::Object(name) => json!({ "object": name }),
+                    Kind::Composite(composite) => json!({ "composite": composite.to_json() }),
                 },
                 "params": node.params,
             })).collect::<Vec<_>>(),
@@ -225,6 +231,8 @@ impl Graph {
                 Kind::Op(spec(name).ok_or_else(|| format!("unknown node `{name}`"))?)
             } else if let Some(name) = node["kind"]["object"].as_str() {
                 Kind::Object(name.to_owned())
+            } else if node["kind"]["composite"].is_object() {
+                Kind::Composite(std::sync::Arc::new(Composite::from_json(&node["kind"]["composite"])?))
             } else {
                 return Err(format!("node {id} has no kind"));
             };
@@ -260,6 +268,14 @@ impl Graph {
             let outputs = match kind {
                 Kind::Op(spec) => self.evaluate_op(id, spec, host),
                 Kind::Object(kind) => self.evaluate_object(id, &kind, host),
+                Kind::Composite(composite) => {
+                    let inputs = composite
+                        .inputs
+                        .iter()
+                        .map(|(name, _)| (name.clone(), self.input(&Port { node: id, field: name.clone() })))
+                        .collect();
+                    composite.evaluate(&inputs, host)
+                }
             };
             if let Some(node) = self.node_mut(id) {
                 node.outputs = outputs;
