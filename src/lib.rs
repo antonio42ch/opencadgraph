@@ -6,6 +6,7 @@
 //! the [`Host`] to create, edit and read objects. It has no user interface
 //! and no document model of its own.
 
+pub mod geometry;
 pub mod ops;
 pub mod value;
 

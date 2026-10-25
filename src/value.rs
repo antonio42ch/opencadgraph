@@ -1,10 +1,10 @@
 //! Port values.
 //!
 //! A value is plain JSON: numbers, text, booleans, `null`, lists (arrays),
-//! points (`{"x", "y", "z"}` objects) and curves (see [`curve`]). Object
-//! ports carry whatever the host puts there. Every node reads its inputs
-//! through the lenient coercions below, so a property shown as text
-//! (`"10.0000"`) feeds a number input.
+//! points and vectors (`{"x", "y", "z"}` objects), curves (see [`curve`])
+//! and planes (see [`plane`]). Object ports carry whatever the host puts
+//! there. Every node reads its inputs through the lenient coercions below,
+//! so a property shown as text (`"10.0000"`) feeds a number input.
 
 use kernel::geom2d::polyline::{Polyline, PolylineVertex};
 use kernel::space::{PlanarCurve, Plane};
@@ -182,17 +182,7 @@ pub fn curve(value: &Value) -> Option<PlanarCurve> {
         _ => return None,
     };
     let plane = match object.get("plane") {
-        Some(plane) => {
-            let axis = |key: &str| -> Option<[f64; 3]> {
-                let items = plane.get(key)?.as_array()?;
-                Some([num(items.first()?)?, num(items.get(1)?)?, num(items.get(2)?)?])
-            };
-            Plane {
-                origin: axis("origin")?,
-                x_axis: axis("x_axis")?,
-                y_axis: axis("y_axis")?,
-            }
-        }
+        Some(plane) => frame(plane)?,
         None => Plane::XY,
     };
     Some(PlanarCurve::new(plane, shape))
@@ -204,7 +194,9 @@ pub fn curve_value(curve: &PlanarCurve) -> Option<Value> {
     use kernel::geom2d::Curve;
     let pair = |p: [f64; 2]| json!([number(p[0]), number(p[1])]);
     let mut value = match &curve.curve {
-        Curve::Line(line) => json!({ "curve": "line", "start": pair(line.start), "end": pair(line.end) }),
+        Curve::Line(line) => {
+            json!({ "curve": "line", "start": pair(line.start), "end": pair(line.end) })
+        }
         Curve::Circle(circle) => json!({
             "curve": "circle",
             "center": pair(circle.centre),
@@ -224,24 +216,62 @@ pub fn curve_value(curve: &PlanarCurve) -> Option<Value> {
                 "closed": polyline.closed,
             });
             if polyline.vertices.iter().any(|v| v.bulge != 0.0) {
-                value["bulges"] =
-                    json!(polyline.vertices.iter().map(|v| number(v.bulge)).collect::<Vec<_>>());
+                value["bulges"] = json!(polyline
+                    .vertices
+                    .iter()
+                    .map(|v| number(v.bulge))
+                    .collect::<Vec<_>>());
             }
             value
         }
-        Curve::Ray(ray) => json!({ "curve": "ray", "origin": pair(ray.origin), "direction": pair(ray.direction) }),
-        Curve::XLine(line) => json!({ "curve": "xline", "base": pair(line.base), "direction": pair(line.direction) }),
+        Curve::Ray(ray) => {
+            json!({ "curve": "ray", "origin": pair(ray.origin), "direction": pair(ray.direction) })
+        }
+        Curve::XLine(line) => {
+            json!({ "curve": "xline", "base": pair(line.base), "direction": pair(line.direction) })
+        }
         Curve::Ellipse(_) | Curve::Nurbs(_) => return None,
     };
     if curve.plane != Plane::XY {
-        let triple = |p: [f64; 3]| json!([number(p[0]), number(p[1]), number(p[2])]);
-        value["plane"] = json!({
-            "origin": triple(curve.plane.origin),
-            "x_axis": triple(curve.plane.x_axis),
-            "y_axis": triple(curve.plane.y_axis),
-        });
+        value["plane"] = frame_value(&curve.plane);
     }
     Some(value)
+}
+
+/// `{"origin", "x_axis", "y_axis"}`, each `[x, y, z]`.
+fn frame(value: &Value) -> Option<Plane> {
+    let axis = |key: &str| -> Option<[f64; 3]> {
+        let items = value.get(key)?.as_array()?;
+        Some([
+            num(items.first()?)?,
+            num(items.get(1)?)?,
+            num(items.get(2)?)?,
+        ])
+    };
+    Some(Plane {
+        origin: axis("origin")?,
+        x_axis: axis("x_axis")?,
+        y_axis: axis("y_axis")?,
+    })
+}
+
+fn frame_value(plane: &Plane) -> Value {
+    let triple = |p: [f64; 3]| json!([number(p[0]), number(p[1]), number(p[2])]);
+    json!({
+        "origin": triple(plane.origin),
+        "x_axis": triple(plane.x_axis),
+        "y_axis": triple(plane.y_axis),
+    })
+}
+
+/// A plane value: `{"plane": {"origin", "x_axis", "y_axis"}}`, the frame
+/// geometry is placed in and oriented between.
+pub fn plane(value: &Value) -> Option<Plane> {
+    frame(value.get("plane")?)
+}
+
+pub fn plane_value(plane: &Plane) -> Value {
+    json!({ "plane": frame_value(plane) })
 }
 
 /// The plane parallel to world XY through height `z`, which curves built
@@ -269,7 +299,8 @@ mod tests {
             let curve = curve(&value).unwrap_or_else(|| panic!("{value}"));
             assert_eq!(curve_value(&curve).unwrap(), value);
         }
-        let arc = curve(&json!({"curve":"arc","center":[0,0],"radius":2,"from":0,"to":90})).unwrap();
+        let arc =
+            curve(&json!({"curve":"arc","center":[0,0],"radius":2,"from":0,"to":90})).unwrap();
         assert!((arc.length() - std::f64::consts::PI).abs() < 1e-9);
         assert!(curve(&json!({"curve":"circle","center":[0,0],"radius":-1})).is_none());
         assert!(curve(&json!({"x":1,"y":2})).is_none());

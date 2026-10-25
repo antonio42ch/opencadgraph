@@ -10,8 +10,10 @@ use std::cmp::Ordering;
 use kernel::geom2d::{cross, Tolerance};
 use serde_json::Value;
 
+use crate::geometry as g;
 use crate::value::{
-    boolean, curve, curve_value, list, num, number, plane_at, point, point_value, text,
+    boolean, curve, curve_value, list, num, number, plane, plane_at, plane_value, point,
+    point_value, text,
 };
 use crate::Host;
 
@@ -57,7 +59,8 @@ impl std::fmt::Debug for Spec {
     }
 }
 
-pub const CATEGORIES: &[&str] = &["Input", "Math", "Logic", "List", "Text", "Geometry", "Curve"];
+pub const CATEGORIES: &[&str] =
+    &["Input", "Math", "Logic", "List", "Text", "Geometry", "Vector", "Curve", "Transform"];
 
 /// The spec called `name`.
 pub fn spec(name: &str) -> Option<&'static Spec> {
@@ -233,6 +236,34 @@ fn offset(curve: &kernel::space::PlanarCurve, distance: f64) -> Value {
         }
         shape => kernel::geom2d::offset_curve(shape, distance, 1e-6).map_or(Value::Null, value),
     }
+}
+
+/// A point or vector input, the origin when unset.
+fn at(value: &Value) -> [f64; 3] {
+    point(value).unwrap_or([0.0; 3])
+}
+
+/// `geometry` carried by the map `(point, vector)`.
+fn moved(geometry: &Value, map: (impl Fn([f64; 3]) -> [f64; 3], impl Fn([f64; 3]) -> [f64; 3])) -> Value {
+    g::map_value(geometry, &g::Map { point: &map.0, vector: &map.1 })
+}
+
+/// A curve from a curve value or the host, back as a value on its plane.
+fn edit(value: &Value, host: &dyn Host, f: impl Fn(&kernel::geom2d::Curve) -> Option<kernel::geom2d::Curve>) -> Value {
+    curve_of(value, host)
+        .and_then(|c| f(&c.curve).map(|shape| kernel::space::PlanarCurve::new(c.plane, shape)))
+        .and_then(|c| curve_value(&c))
+        .unwrap_or(Value::Null)
+}
+
+/// Frames at `count` even spacings along `c`: both ends for an open curve,
+/// once round for a closed one.
+fn frames_along(c: &kernel::space::PlanarCurve, count: usize) -> Vec<kernel::space::Plane> {
+    let length = c.length();
+    let steps = if c.curve.is_closed() { count } else { count.saturating_sub(1).max(1) };
+    (0..count)
+        .filter_map(|k| g::curve_frame(c, c.parameter_at_distance(length * k as f64 / steps as f64)))
+        .collect()
 }
 
 fn same_plane(a: &kernel::space::Plane, b: &kernel::space::Plane) -> bool {
@@ -640,6 +671,220 @@ pub const LIBRARY: &[Spec] = &[
             (Some(c), Some(d)) => offset(&c, d),
             _ => Value::Null,
         }) },
+    // ── Vector ───────────────────────────────────────────────────────────
+    // Vectors are written as points; planes as {"plane": …} (see value).
+    Spec { name: "Vector", category: "Vector", inputs: &[n("x", 1.0), n("y", 0.0), n("z", 0.0)], outputs: &["vector"],
+        eval: |a, _| out(match (num(&a[0]), num(&a[1]), num(&a[2])) {
+            (Some(x), Some(y), Some(z)) => point_value([x, y, z]),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Vector Between", category: "Vector", inputs: &[v("from"), v("to")], outputs: &["vector"],
+        eval: |a, _| out(match (point(&a[0]), point(&a[1])) {
+            (Some(p), Some(q)) => point_value(g::sub(q, p)),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Vector Length", category: "Vector", inputs: &[v("vector")], outputs: RESULT,
+        eval: |a, _| out(point(&a[0]).map_or(Value::Null, |v| number(g::length(v)))) },
+    Spec { name: "Unit Vector", category: "Vector", inputs: &[v("vector")], outputs: &["vector"],
+        eval: |a, _| out(point(&a[0]).and_then(g::unit).map_or(Value::Null, point_value)) },
+    Spec { name: "Scale Vector", category: "Vector", inputs: &[v("vector"), n("factor", 2.0)], outputs: &["vector"],
+        eval: |a, _| out(match (point(&a[0]), num(&a[1])) {
+            (Some(v), Some(k)) => point_value(g::scale(v, k)),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Add Vectors", category: "Vector", inputs: PQ, outputs: &["vector"],
+        eval: |a, _| out(match (point(&a[0]), point(&a[1])) {
+            (Some(p), Some(q)) => point_value(g::add(p, q)),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Dot Product", category: "Vector", inputs: PQ, outputs: RESULT,
+        eval: |a, _| out(match (point(&a[0]), point(&a[1])) {
+            (Some(p), Some(q)) => number(g::dot(p, q)),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Cross Product", category: "Vector", inputs: PQ, outputs: &["vector"],
+        eval: |a, _| out(match (point(&a[0]), point(&a[1])) {
+            (Some(p), Some(q)) => point_value(g::cross(p, q)),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Plane", category: "Vector", inputs: &[v("origin"), v("x_axis"), v("y_axis")], outputs: &["plane"],
+        eval: |a, _| out(g::frame(at(&a[0]), point(&a[1]).unwrap_or([1.0, 0.0, 0.0]), point(&a[2]).unwrap_or([0.0, 1.0, 0.0]))
+            .map_or(Value::Null, |p| plane_value(&p))) },
+    Spec { name: "XY Plane", category: "Vector", inputs: &[v("origin")], outputs: &["plane"],
+        eval: |a, _| out(plane_value(&kernel::space::Plane { origin: at(&a[0]), ..kernel::space::Plane::XY })) },
+    Spec { name: "Curve Frame", category: "Vector", inputs: &[v("curve"), n("t", 0.0)], outputs: &["plane"],
+        eval: |a, host| out(match (curve_of(&a[0], host), num(&a[1])) {
+            (Some(c), Some(t)) => g::curve_frame(&c, t).map_or(Value::Null, |p| plane_value(&p)),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Plane Components", category: "Vector", inputs: &[v("plane")],
+        outputs: &["origin", "x_axis", "y_axis", "normal"],
+        eval: |a, _| match plane(&a[0]).and_then(|p| g::frame(p.origin, p.x_axis, p.y_axis)) {
+            Some(p) => vec![
+                point_value(p.origin),
+                point_value(p.x_axis),
+                point_value(p.y_axis),
+                point_value(g::cross(p.x_axis, p.y_axis)),
+            ],
+            None => vec![Value::Null; 4],
+        } },
+    // ── Curve, built and edited ──────────────────────────────────────────
+    Spec { name: "Line By Direction", category: "Curve", inputs: &[v("start"), v("direction"), n("length", 0.0)],
+        outputs: &["curve"],
+        eval: |a, _| out(match (point(&a[0]), point(&a[1]).and_then(g::unit)) {
+            (Some(p), Some(u)) => {
+                // A zero or missing length takes the direction's own.
+                let length = num(&a[2]).filter(|l| *l != 0.0)
+                    .unwrap_or_else(|| point(&a[1]).map_or(0.0, g::length));
+                let q = g::add(p, g::scale(u, length));
+                flat_curve(p[2], kernel::geom2d::Curve::Line(kernel::geom2d::Line { start: [p[0], p[1]], end: [q[0], q[1]] }))
+            }
+            _ => Value::Null,
+        }) },
+    Spec { name: "Arc 3 Points", category: "Curve", inputs: &[v("a"), v("b"), v("c")], outputs: &["curve"],
+        eval: |a, _| out(match (point(&a[0]), point(&a[1]), point(&a[2])) {
+            (Some(p), Some(q), Some(r)) => g::arc_through(p, q, r).map_or(Value::Null, |shape| flat_curve(p[2], shape)),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Circle 3 Points", category: "Curve", inputs: &[v("a"), v("b"), v("c")], outputs: &["curve"],
+        eval: |a, _| out(match (point(&a[0]), point(&a[1]), point(&a[2])) {
+            (Some(p), Some(q), Some(r)) => g::circle_through(p, q, r)
+                .map_or(Value::Null, |(centre, radius)| flat_curve(p[2], g::circle(centre, radius))),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Rectangle", category: "Curve", inputs: &[v("corner"), n("width", 10.0), n("height", 5.0)],
+        outputs: &["curve"],
+        eval: |a, _| out(match (num(&a[1]), num(&a[2])) {
+            (Some(w), Some(h)) if w != 0.0 && h != 0.0 => {
+                let c = at(&a[0]);
+                flat_curve(c[2], g::closed_polyline(&[[c[0], c[1]], [c[0] + w, c[1]], [c[0] + w, c[1] + h], [c[0], c[1] + h]]))
+            }
+            _ => Value::Null,
+        }) },
+    Spec { name: "Polygon", category: "Curve", inputs: &[v("center"), n("radius", 5.0), n("sides", 6.0)],
+        outputs: &["curve"],
+        eval: |a, _| out(match (num(&a[1]), num(&a[2])) {
+            (Some(r), Some(sides)) if r > 0.0 && sides >= 3.0 => {
+                let (c, sides) = (at(&a[0]), (sides as usize).min(MAX_ITEMS));
+                let corners: Vec<[f64; 2]> = (0..sides)
+                    .map(|k| {
+                        let angle = std::f64::consts::TAU * k as f64 / sides as f64;
+                        [c[0] + r * angle.cos(), c[1] + r * angle.sin()]
+                    })
+                    .collect();
+                flat_curve(c[2], g::closed_polyline(&corners))
+            }
+            _ => Value::Null,
+        }) },
+    Spec { name: "Explode Curve", category: "Curve", inputs: CURVE, outputs: &["curves"],
+        eval: |a, host| out(match curve_of(&a[0], host) {
+            Some(c) => {
+                let segments = c.curve.segments();
+                let pieces = if segments.is_empty() { vec![c.curve.clone()] } else { segments };
+                Value::Array(pieces.into_iter()
+                    .filter_map(|shape| curve_value(&kernel::space::PlanarCurve::new(c.plane, shape)))
+                    .collect())
+            }
+            None => Value::Null,
+        }) },
+    Spec { name: "Join Curves", category: "Curve", inputs: &[l("curves")], outputs: &["curves"],
+        eval: |a, host| {
+            let shapes: Vec<kernel::space::PlanarCurve> = list(&a[0]).iter().filter_map(|c| curve_of(c, host)).collect();
+            out(Value::Array(g::join(&shapes, 1e-6).iter().filter_map(curve_value).collect()))
+        } },
+    Spec { name: "Reverse Curve", category: "Curve", inputs: CURVE, outputs: &["curve"],
+        eval: |a, host| out(edit(&a[0], host, g::reverse)) },
+    Spec { name: "Close Curve", category: "Curve", inputs: CURVE, outputs: &["curve"],
+        eval: |a, host| out(edit(&a[0], host, g::close)) },
+    Spec { name: "Extend Curve", category: "Curve", inputs: &[v("curve"), n("start", 0.0), n("end", 1.0)],
+        outputs: &["curve"],
+        eval: |a, host| {
+            let (start, end) = (num(&a[1]).unwrap_or(0.0), num(&a[2]).unwrap_or(0.0));
+            out(edit(&a[0], host, |shape| g::extend(shape, start, end)))
+        } },
+    Spec { name: "Fillet Corners", category: "Curve", inputs: &[v("curve"), n("radius", 1.0)], outputs: &["curve"],
+        eval: |a, host| {
+            let radius = num(&a[1]).unwrap_or(0.0);
+            out(edit(&a[0], host, |shape| g::fillet(shape, radius)))
+        } },
+    Spec { name: "Closest Point", category: "Curve", inputs: &[v("curve"), v("point")],
+        outputs: &["point", "t", "distance"],
+        eval: |a, host| match (curve_of(&a[0], host), point(&a[1])) {
+            (Some(c), Some(p)) => match c.plane.project(p) {
+                Some(uv) => {
+                    let found = kernel::geom2d::closest_point(&c.curve, uv);
+                    let at = c.plane.point_at(found.point);
+                    vec![point_value(at), number(found.t), number(g::length(g::sub(at, p)))]
+                }
+                None => vec![Value::Null; 3],
+            },
+            _ => vec![Value::Null; 3],
+        } },
+    // ── Transform ────────────────────────────────────────────────────────
+    // Points, curves, planes and lists of them alike.
+    Spec { name: "Move", category: "Transform", inputs: &[v("geometry"), v("vector")], outputs: &["geometry"],
+        eval: |a, _| {
+            let by = at(&a[1]);
+            out(moved(&a[0], (move |p| g::add(p, by), |v| v)))
+        } },
+    Spec { name: "Rotate", category: "Transform", inputs: &[v("geometry"), v("center"), n("angle", 90.0)],
+        outputs: &["geometry"],
+        eval: |a, _| out(num(&a[2]).map_or(Value::Null, |angle| moved(&a[0], g::rotation(at(&a[1]), angle)))) },
+    Spec { name: "Scale", category: "Transform", inputs: &[v("geometry"), v("center"), n("factor", 2.0)],
+        outputs: &["geometry"],
+        eval: |a, _| out(match num(&a[2]) {
+            Some(k) if k != 0.0 => {
+                let c = at(&a[1]);
+                moved(&a[0], (move |p| g::add(c, g::scale(g::sub(p, c), k)), move |v| g::scale(v, k)))
+            }
+            _ => Value::Null,
+        }) },
+    Spec { name: "Mirror", category: "Transform", inputs: &[v("geometry"), v("a"), v("b")], outputs: &["geometry"],
+        eval: |a, _| out(match (point(&a[1]), point(&a[2])) {
+            (Some(p), Some(q)) => g::mirror(p, q).map_or(Value::Null, |map| moved(&a[0], map)),
+            _ => Value::Null,
+        }) },
+    Spec { name: "Orient", category: "Transform", inputs: &[v("geometry"), v("from"), v("to")], outputs: &["geometry"],
+        eval: |a, _| {
+            let from = plane(&a[1]).unwrap_or(kernel::space::Plane::XY);
+            out(match plane(&a[2]).and_then(|to| g::orientation(&from, &to)) {
+                Some(map) => moved(&a[0], map),
+                None => Value::Null,
+            })
+        } },
+    Spec { name: "Linear Array", category: "Transform", inputs: &[v("geometry"), v("vector"), n("count", 3.0)],
+        outputs: &["geometry"],
+        eval: |a, _| {
+            let (by, count) = (at(&a[1]), num(&a[2]).map_or(0, |c| (c.max(0.0) as usize).min(MAX_ITEMS)));
+            out(Value::Array((0..count).map(|k| {
+                let shift = g::scale(by, k as f64);
+                moved(&a[0], (move |p| g::add(p, shift), |v| v))
+            }).collect()))
+        } },
+    Spec { name: "Polar Array", category: "Transform",
+        inputs: &[v("geometry"), v("center"), n("count", 6.0), n("angle", 360.0)], outputs: &["geometry"],
+        eval: |a, _| {
+            let count = num(&a[2]).map_or(0, |c| (c.max(0.0) as usize).min(MAX_ITEMS));
+            let angle = num(&a[3]).unwrap_or(360.0);
+            // A full turn spaces copies evenly round it; a part turn puts
+            // the last copy at its end.
+            let full = (angle.abs() - 360.0).abs() < 1e-9;
+            let steps = if full { count } else { count.saturating_sub(1).max(1) };
+            out(Value::Array((0..count)
+                .map(|k| moved(&a[0], g::rotation(at(&a[1]), angle * k as f64 / steps as f64)))
+                .collect()))
+        } },
+    Spec { name: "Curve Array", category: "Transform", inputs: &[v("geometry"), v("curve"), n("count", 5.0)],
+        outputs: &["geometry"],
+        eval: |a, host| out(match curve_of(&a[1], host) {
+            Some(c) => {
+                let count = num(&a[2]).map_or(0, |n| (n.max(0.0) as usize).min(MAX_ITEMS));
+                Value::Array(frames_along(&c, count).iter()
+                    .map(|to| g::orientation(&kernel::space::Plane::XY, to).map_or(Value::Null, |map| moved(&a[0], map)))
+                    .collect())
+            }
+            None => Value::Null,
+        }) },
 ];
 
 #[cfg(test)]
@@ -713,5 +958,70 @@ mod tests {
     #[test]
     fn a_polyline_needs_two_points() {
         assert_eq!(run("Polyline Curve", &[json!([p(0.0, 0.0)]), json!(false)])[0], Value::Null);
+    }
+
+    fn length_of(value: &Value) -> f64 {
+        num(&run("Curve Length", &[value.clone()])[0]).unwrap()
+    }
+
+    #[test]
+    fn constructors_make_the_shapes_they_name() {
+        let rectangle = run("Rectangle", &[p(1.0, 1.0), json!(4.0), json!(3.0)]).remove(0);
+        assert!((length_of(&rectangle) - 14.0).abs() < 1e-9);
+        let hexagon = run("Polygon", &[p(0.0, 0.0), json!(1.0), json!(6.0)]).remove(0);
+        assert!((length_of(&hexagon) - 6.0).abs() < 1e-9);
+        let arc = run("Arc 3 Points", &[p(1.0, 0.0), p(0.0, 1.0), p(-1.0, 0.0)]).remove(0);
+        assert!((length_of(&arc) - std::f64::consts::PI).abs() < 1e-9);
+        let line = run("Line By Direction", &[p(0.0, 0.0), p(0.0, 2.0), json!(5.0)]).remove(0);
+        assert_eq!(line["end"], json!([0.0, 5.0]));
+    }
+
+    #[test]
+    fn transforms_carry_points_curves_and_lists() {
+        let line = run("Line Curve", &[p(0.0, 0.0), p(1.0, 0.0)]).remove(0);
+        let moved = run("Move", &[json!([line.clone(), p(1.0, 1.0)]), point_value([0.0, 0.0, 2.0])]).remove(0);
+        assert!(moved[0]["plane"].is_object(), "raised to z 2: {moved}");
+        assert_eq!(point(&moved[1]), Some([1.0, 1.0, 2.0]));
+
+        let copies = run("Linear Array", &[line.clone(), p(0.0, 3.0), json!(4.0)]).remove(0);
+        assert_eq!(copies.as_array().map(Vec::len), Some(4));
+        assert_eq!(copies[3]["start"], json!([0.0, 9.0]));
+
+        let ring = run("Polar Array", &[p(5.0, 0.0), p(0.0, 0.0), json!(4.0), json!(360.0)]).remove(0);
+        let last = point(&ring[3]).unwrap();
+        assert!((last[0]).abs() < 1e-9 && (last[1] + 5.0).abs() < 1e-9, "{ring}");
+
+        // Posts along a path, each turned to face along it.
+        let path = run("Line Curve", &[p(0.0, 0.0), p(0.0, 10.0)]).remove(0);
+        let posts = run("Curve Array", &[p(1.0, 0.0), path, json!(3.0)]).remove(0);
+        let mid = point(&posts[1]).unwrap();
+        assert!((mid[0]).abs() < 1e-9 && (mid[1] - 6.0).abs() < 1e-9, "{posts}");
+    }
+
+    #[test]
+    fn planes_and_closest_points() {
+        let wall = run("Plane", &[p(0.0, 0.0), p(1.0, 0.0), point_value([0.0, 0.0, 1.0])]).remove(0);
+        let parts = run("Plane Components", &[wall]);
+        assert_eq!(point(&parts[3]), Some([0.0, -1.0, 0.0]));
+        let line = run("Line Curve", &[p(0.0, 0.0), p(10.0, 0.0)]).remove(0);
+        let near = run("Closest Point", &[line, p(4.0, 3.0)]);
+        assert_eq!(point(&near[0]), Some([4.0, 0.0, 0.0]));
+        assert_eq!(near[2], json!(3.0));
+    }
+
+    #[test]
+    fn joined_and_filleted_outlines() {
+        let line = |a: (f64, f64), b: (f64, f64)| run("Line Curve", &[p(a.0, a.1), p(b.0, b.1)]).remove(0);
+        let joined = run(
+            "Join Curves",
+            &[json!([line((0.0, 0.0), (4.0, 0.0)), line((4.0, 4.0), (4.0, 0.0)), line((4.0, 4.0), (0.0, 0.0))])],
+        )
+        .remove(0);
+        assert_eq!(joined.as_array().map(Vec::len), Some(1));
+        assert_eq!(joined[0]["closed"], true);
+        let pieces = run("Explode Curve", &[joined[0].clone()]).remove(0);
+        assert_eq!(pieces.as_array().map(Vec::len), Some(3));
+        let round = run("Fillet Corners", &[joined[0].clone(), json!(0.5)]).remove(0);
+        assert!(length_of(&round) < length_of(&joined[0]));
     }
 }
