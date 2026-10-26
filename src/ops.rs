@@ -153,6 +153,30 @@ fn range(start: f64, count: usize, step: f64) -> Value {
     Value::Array((0..count.min(MAX_ITEMS)).map(|k| number(start + step * k as f64)).collect())
 }
 
+/// `x` with `decimals` decimals, at least `digits` integer digits (zero
+/// padded), the integer digits in groups of `group` from the right joined by
+/// `separator` (none when 0): 1234.5 as `1,234.50`, or 30 as the station
+/// `0+030.00` with 4 digits in groups of 3 joined by `+`.
+fn format_number(x: f64, decimals: usize, digits: usize, group: usize, separator: &str, mark: &str) -> String {
+    let fixed = format!("{:.*}", decimals, x.abs());
+    let (whole, fraction) = fixed.split_once('.').unwrap_or((&fixed, ""));
+    let whole = format!("{whole:0>digits$}");
+    let mut grouped = String::new();
+    for (k, digit) in whole.chars().enumerate() {
+        if group > 0 && k > 0 && (whole.len() - k) % group == 0 {
+            grouped.push_str(separator);
+        }
+        grouped.push(digit);
+    }
+    let negative = x < 0.0 && fixed.chars().any(|c| c.is_ascii_digit() && c != '0');
+    let mut result = if negative { format!("-{grouped}") } else { grouped };
+    if !fraction.is_empty() {
+        result.push_str(mark);
+        result.push_str(fraction);
+    }
+    result
+}
+
 fn flatten(value: &Value, into: &mut Vec<Value>) {
     match value {
         Value::Array(items) => items.iter().for_each(|item| flatten(item, into)),
@@ -377,11 +401,24 @@ pub const LIBRARY: &[Spec] = &[
             None => Value::Null,
         }) },
     // ── List ─────────────────────────────────────────────────────────────
-    Spec { name: "Range", category: "List", inputs: &[n("start", 0.0), n("end", 10.0), n("step", 1.0)],
+    Spec { name: "Range", category: "List",
+        inputs: &[n("start", 0.0), n("end", 10.0), n("step", 1.0), b("include end", false)],
         outputs: &["list"],
         eval: |a, _| out(match (num(&a[0]), num(&a[1]), num(&a[2])) {
             (Some(start), Some(end), Some(step)) if step != 0.0 && (end - start) / step >= 0.0 => {
-                range(start, ((end - start) / step + 1e-9).floor() as usize + 1, step)
+                let count = ((end - start) / step + 1e-9).floor() as usize + 1;
+                let mut values = range(start, count, step);
+                // A step that does not divide the span stops short of `end`.
+                let last = start + step * (count - 1) as f64;
+                if boolean(&a[3]) == Some(true)
+                    && count < MAX_ITEMS
+                    && (end - last).abs() > 1e-9 * end.abs().max(1.0)
+                {
+                    if let Value::Array(items) = &mut values {
+                        items.push(number(end));
+                    }
+                }
+                values
             }
             _ => Value::Array(Vec::new()),
         }) },
@@ -582,6 +619,21 @@ pub const LIBRARY: &[Spec] = &[
         eval: |a, _| out(num(&a[0]).map_or(Value::Null, number)) },
     Spec { name: "To Text", category: "Text", inputs: &[l("value")], outputs: RESULT,
         eval: |a, _| out(Value::String(text(&a[0]))) },
+    Spec { name: "Format Number", category: "Text",
+        inputs: &[n("value", 0.0), n("decimals", 2.0), n("digits", 1.0), n("group size", 0.0),
+            s("separator", ","), s("decimal mark", ".")],
+        outputs: RESULT,
+        eval: |a, _| out(match num(&a[0]) {
+            Some(x) => Value::String(format_number(
+                x,
+                num(&a[1]).unwrap_or(0.0).clamp(0.0, 12.0) as usize,
+                num(&a[2]).unwrap_or(1.0).clamp(1.0, 32.0) as usize,
+                num(&a[3]).unwrap_or(0.0).clamp(0.0, 32.0) as usize,
+                &text(&a[4]),
+                &text(&a[5]),
+            )),
+            None => Value::Null,
+        }) },
     // ── Geometry ─────────────────────────────────────────────────────────
     Spec { name: "Point", category: "Geometry", inputs: &[n("x", 0.0), n("y", 0.0), n("z", 0.0)], outputs: POINT,
         eval: |a, _| out(match (num(&a[0]), num(&a[1]), num(&a[2])) {
@@ -785,6 +837,21 @@ pub const LIBRARY: &[Spec] = &[
             (Some(c), Some(t)) => g::curve_frame(&c, t).map_or(Value::Null, |p| plane_value(&p)),
             _ => Value::Null,
         }) },
+    Spec { name: "Frame At Distance", category: "Vector", inputs: &[v("curve"), n("distance", 0.0)],
+        outputs: &["plane", "point", "tangent", "perpendicular", "angle"],
+        eval: |a, host| match (curve_of(&a[0], host), num(&a[1])) {
+            (Some(c), Some(d)) => match g::curve_frame(&c, c.parameter_at_distance(d)) {
+                Some(p) => vec![
+                    plane_value(&p),
+                    point_value(p.origin),
+                    point_value(p.x_axis),
+                    point_value(p.y_axis),
+                    number(p.x_axis[1].atan2(p.x_axis[0]).to_degrees()),
+                ],
+                None => vec![Value::Null; 5],
+            },
+            _ => vec![Value::Null; 5],
+        } },
     Spec { name: "Plane Components", category: "Vector", inputs: &[v("plane")],
         outputs: &["origin", "x_axis", "y_axis", "normal"],
         eval: |a, _| match plane(&a[0]).and_then(|p| g::frame(p.origin, p.x_axis, p.y_axis)) {
@@ -986,6 +1053,40 @@ mod tests {
 
     fn p(x: f64, y: f64) -> Value {
         point_value([x, y, 0.0])
+    }
+
+    #[test]
+    fn range_can_end_on_its_end() {
+        let stations = |include: bool| run("Range", &[json!(0.0), json!(200.0), json!(30.0), json!(include)]);
+        assert_eq!(stations(false)[0].as_array().unwrap().len(), 7);
+        assert_eq!(stations(true)[0].as_array().unwrap().last(), Some(&json!(200.0)));
+        let exact = run("Range", &[json!(0.0), json!(200.0), json!(20.0), json!(true)]);
+        assert_eq!(exact[0].as_array().unwrap().len(), 11);
+    }
+
+    #[test]
+    fn numbers_format_as_stations_and_thousands() {
+        let format = |x: f64, decimals: f64, digits: f64, group: f64, separator: &str| {
+            run("Format Number", &[json!(x), json!(decimals), json!(digits), json!(group), json!(separator), json!(".")])
+                .remove(0)
+        };
+        assert_eq!(format(30.0, 2.0, 4.0, 3.0, "+"), json!("0+030.00"));
+        assert_eq!(format(1234.5, 2.0, 4.0, 3.0, "+"), json!("1+234.50"));
+        assert_eq!(format(1234567.891, 1.0, 1.0, 3.0, ","), json!("1,234,567.9"));
+        assert_eq!(format(-7.0, 0.0, 3.0, 0.0, ","), json!("-007"));
+        assert_eq!(format(-0.001, 2.0, 1.0, 0.0, ","), json!("0.00"));
+    }
+
+    #[test]
+    fn a_frame_at_a_distance_follows_the_curve() {
+        let path = run("Polyline Curve", &[json!([p(0.0, 0.0), p(10.0, 0.0), p(10.0, 10.0)]), json!(false)]).remove(0);
+        let frame = run("Frame At Distance", &[path, json!(15.0)]);
+        assert_eq!(point(&frame[1]), Some([10.0, 5.0, 0.0]));
+        let tangent = point(&frame[2]).unwrap();
+        assert!(tangent[0].abs() < 1e-9 && (tangent[1] - 1.0).abs() < 1e-9);
+        let perpendicular = point(&frame[3]).unwrap();
+        assert!((perpendicular[0] + 1.0).abs() < 1e-9);
+        assert!((num(&frame[4]).unwrap() - 90.0).abs() < 1e-9);
     }
 
     #[test]

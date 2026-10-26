@@ -7,6 +7,7 @@
 //! and no document model of its own.
 
 pub mod composite;
+pub mod docs;
 pub mod geometry;
 pub mod ops;
 pub mod value;
