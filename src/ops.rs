@@ -177,6 +177,9 @@ fn format_number(x: f64, decimals: usize, digits: usize, group: usize, separator
     result
 }
 
+/// Columns a Table node gives apart.
+const TABLE_COLUMNS: usize = 8;
+
 fn flatten(value: &Value, into: &mut Vec<Value>) {
     match value {
         Value::Array(items) => items.iter().for_each(|item| flatten(item, into)),
@@ -262,6 +265,39 @@ fn offset(curve: &kernel::space::PlanarCurve, distance: f64) -> Value {
     }
 }
 
+/// Every closed curve in `value`, a curve or a nested list of them.
+fn closed_curves(value: &Value, host: &dyn Host, into: &mut Vec<kernel::space::PlanarCurve>) {
+    match value {
+        Value::Array(items) => items.iter().for_each(|item| closed_curves(item, host, into)),
+        Value::Null => {}
+        other => into.extend(curve_of(other, host).filter(|c| c.curve.is_closed())),
+    }
+}
+
+/// The regions `keep` picks from the closed curves of `a` and of `b`, each
+/// a list of its outline and its holes, and their net area.
+fn regions(a: &[Value], host: &dyn Host, keep: fn(bool, bool) -> bool) -> Vec<Value> {
+    let (mut first, mut second) = (Vec::new(), Vec::new());
+    closed_curves(&a[0], host, &mut first);
+    closed_curves(&a[1], host, &mut second);
+    let Some(plane) = first.iter().chain(&second).map(|c| c.plane).next() else {
+        return vec![Value::Null; 2];
+    };
+    let on_plane = |shapes: Vec<kernel::space::PlanarCurve>| -> Vec<kernel::geom2d::Curve> {
+        shapes.into_iter().filter(|c| same_plane(&c.plane, &plane)).map(|c| c.curve).collect()
+    };
+    let regions = g::boolean(&on_plane(first), &on_plane(second), keep);
+    let area: f64 = regions.iter().flatten().map(|shape| shape.enclosed_area()).sum();
+    vec![
+        Value::Array(regions.into_iter()
+            .map(|region| Value::Array(region.into_iter()
+                .filter_map(|shape| curve_value(&kernel::space::PlanarCurve::new(plane, shape)))
+                .collect()))
+            .collect()),
+        number(area),
+    ]
+}
+
 /// A point or vector input, the origin when unset.
 fn at(value: &Value) -> [f64; 3] {
     point(value).unwrap_or([0.0; 3])
@@ -323,6 +359,21 @@ pub const LIBRARY: &[Spec] = &[
         eval: |a, host| out(host.expression(&substitute(&text(&a[0]), &a[1..])).map_or(Value::Null, number)) },
     Spec { name: "Watch", category: "Input", inputs: &[l("in")], outputs: &["out"],
         eval: |a, _| out(a[0].clone()) },
+    Spec { name: "Table", category: "Input", inputs: &[l("table"), b("header", true)],
+        outputs: &["column 1", "column 2", "column 3", "column 4", "column 5", "column 6", "column 7", "column 8",
+            "rows", "count"],
+        eval: |a, _| {
+            let mut rows = crate::value::table(&a[0]);
+            if boolean(&a[1]).unwrap_or(true) && !rows.is_empty() {
+                rows.remove(0);
+            }
+            let mut outputs: Vec<Value> = (0..TABLE_COLUMNS)
+                .map(|k| Value::Array(rows.iter().map(|row| row.get(k).cloned().unwrap_or(Value::Null)).collect()))
+                .collect();
+            outputs.push(number(rows.len() as f64));
+            outputs.insert(TABLE_COLUMNS, Value::Array(rows.into_iter().map(Value::Array).collect()));
+            outputs
+        } },
     // ── Math ─────────────────────────────────────────────────────────────
     Spec { name: "Add", category: "Math", inputs: AB, outputs: RESULT, eval: |a, _| f2(a, |x, y| x + y) },
     Spec { name: "Subtract", category: "Math", inputs: AB, outputs: RESULT, eval: |a, _| f2(a, |x, y| x - y) },
@@ -400,6 +451,14 @@ pub const LIBRARY: &[Spec] = &[
             Some(false) => a[2].clone(),
             None => Value::Null,
         }) },
+    Spec { name: "Choose", category: "Logic",
+        inputs: &[n("index", 0.0), l("option 0"), l("option 1"), l("option 2"), l("option 3"), l("option 4")],
+        outputs: &["value"],
+        eval: |a, _| out(num(&a[0])
+            .filter(|i| *i >= 0.0)
+            .and_then(|i| a.get(1 + i as usize))
+            .cloned()
+            .unwrap_or(Value::Null)) },
     // ── List ─────────────────────────────────────────────────────────────
     Spec { name: "Range", category: "List",
         inputs: &[n("start", 0.0), n("end", 10.0), n("step", 1.0), b("include end", false)],
@@ -808,6 +867,12 @@ pub const LIBRARY: &[Spec] = &[
             }
             _ => vec![Value::Null; 3],
         } },
+    Spec { name: "Region Union", category: "Curve", inputs: &[l("a"), l("b")], outputs: &["regions", "area"],
+        eval: |a, host| regions(a, host, |a, b| a || b) },
+    Spec { name: "Region Difference", category: "Curve", inputs: &[l("a"), l("b")], outputs: &["regions", "area"],
+        eval: |a, host| regions(a, host, |a, b| a && !b) },
+    Spec { name: "Region Intersection", category: "Curve", inputs: &[l("a"), l("b")], outputs: &["regions", "area"],
+        eval: |a, host| regions(a, host, |a, b| a && b) },
     Spec { name: "Sub Curve", category: "Curve", inputs: &[v("curve"), n("from", 0.0), n("to", 1.0)],
         outputs: &["curve"],
         eval: |a, host| {
@@ -1140,6 +1205,40 @@ mod tests {
         assert!((area(&outline) - 20.0).abs() < 1e-6, "{outline}");
         let ring = run("Offset Both Sides", &[run("Circle Curve", &[p(0.0, 0.0), json!(5.0)]).remove(0), json!(1.0)]);
         assert_eq!(ring[0].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn regions_merge_cut_and_overlap() {
+        let square = |x: f64, y: f64, size: f64| run("Rectangle", &[p(x, y), json!(size), json!(size)]).remove(0);
+        let (a, b) = (square(0.0, 0.0, 10.0), square(5.0, 5.0, 10.0));
+        let area = |name: &str, a: &Value, b: &Value| num(&run(name, &[a.clone(), b.clone()])[1]).unwrap();
+        assert!((area("Region Union", &a, &b) - 175.0).abs() < 1e-6);
+        assert!((area("Region Difference", &a, &b) - 75.0).abs() < 1e-6);
+        assert!((area("Region Intersection", &a, &b) - 25.0).abs() < 1e-6);
+        let union = run("Region Union", &[a.clone(), b]).remove(0);
+        assert_eq!(union.as_array().unwrap().len(), 1, "one region: {union}");
+        assert_eq!(union[0].as_array().unwrap().len(), 1, "no holes: {union}");
+        // A hole inside: one region, its outline and a clockwise hole.
+        let holed = run("Region Difference", &[a, square(2.0, 2.0, 2.0)]);
+        assert_eq!(holed[0].as_array().unwrap().len(), 1);
+        assert_eq!(holed[0][0].as_array().unwrap().len(), 2);
+        assert!((num(&holed[1]).unwrap() - 96.0).abs() < 1e-6);
+        let circle = run("Circle Curve", &[p(0.0, 0.0), json!(1.0)]).remove(0);
+        let disc = num(&run("Region Union", &[circle, json!(null)])[1]).unwrap();
+        assert!((disc - std::f64::consts::PI).abs() < 1e-2, "{disc}");
+    }
+
+    #[test]
+    fn tables_give_columns_and_choose_picks_an_option() {
+        let pasted = run("Table", &[json!("at\twidth\tkind\n2\t0.9\tdoor\n6\t1.5\twindow\n"), json!(true)]);
+        assert_eq!(pasted[0], json!([2.0, 6.0]));
+        assert_eq!(pasted[2], json!(["door", "window"]));
+        assert_eq!(pasted[9], json!(2.0));
+        let typed = run("Table", &[json!([["a", "b"], ["1", "x"]]), json!(false)]);
+        assert_eq!(typed[0], json!(["a", 1.0]));
+        let pick = run("Choose", &[json!(1.0), json!("simple"), json!([1, 2]), json!(null), json!(null), json!(null)]);
+        assert_eq!(pick[0], json!([1, 2]));
+        assert_eq!(run("Choose", &[json!(7.0), json!(1), json!(2), json!(3), json!(4), json!(5)])[0], Value::Null);
     }
 
     #[test]

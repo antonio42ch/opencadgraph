@@ -69,6 +69,58 @@ pub struct Node {
     pub params: BTreeMap<String, Value>,
     /// Results of the last evaluation.
     pub outputs: BTreeMap<String, Value>,
+    /// Why the last evaluation gave no result, once per reason.
+    pub issues: Vec<Issue>,
+}
+
+/// Why an operation gave no result for a set of values.
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Issue {
+    /// Nothing feeds this input and it has no value of its own.
+    Missing(String),
+    /// The list this input reads is empty.
+    EmptyList(String),
+    /// Every input has a value, and still there is no result: a size of
+    /// zero, coincident points, a distance off the curve…
+    NoResult,
+    /// A step inside a composite, by its operation's name, has an issue.
+    Inner(String, Box<Issue>),
+}
+
+impl Issue {
+    /// The issue in English.
+    pub fn message(&self) -> String {
+        match self {
+            Issue::Missing(input) => format!("Nothing feeds {input}"),
+            Issue::EmptyList(input) => format!("The list on {input} is empty"),
+            Issue::NoResult => "No result with these values".to_owned(),
+            Issue::Inner(step, issue) => format!("{step}: {}", issue.message()),
+        }
+    }
+}
+
+/// At most this many issues are kept per node.
+pub(crate) const MAX_ISSUES: usize = 4;
+
+/// Why `spec` gave nothing for `args`.
+fn diagnose(spec: &Spec, args: &[Value]) -> Issue {
+    for (input, arg) in spec.inputs.iter().zip(args) {
+        let empty = match arg {
+            Value::Null => true,
+            Value::Array(items) => items.is_empty(),
+            _ => false,
+        };
+        if !empty {
+            continue;
+        }
+        if input.list {
+            return Issue::EmptyList(input.name.to_owned());
+        }
+        if matches!(input.default, ops::Initial::None) {
+            return Issue::Missing(input.name.to_owned());
+        }
+    }
+    Issue::NoResult
 }
 
 #[derive(Clone, Debug, Default)]
@@ -95,6 +147,7 @@ impl Graph {
             kind,
             params,
             outputs: BTreeMap::new(),
+            issues: Vec::new(),
         });
         self.next_id
     }
@@ -266,39 +319,51 @@ impl Graph {
             let Some(kind) = self.node(id).map(|node| node.kind.clone()) else {
                 continue;
             };
-            let outputs = match kind {
+            let (outputs, issues) = match kind {
                 Kind::Op(spec) => self.evaluate_op(id, spec, host),
-                Kind::Object(kind) => self.evaluate_object(id, &kind, host),
+                Kind::Object(kind) => (self.evaluate_object(id, &kind, host), Vec::new()),
                 Kind::Composite(composite) => {
                     let inputs = composite
                         .inputs
                         .iter()
                         .map(|(name, _)| (name.clone(), self.input(&Port { node: id, field: name.clone() })))
                         .collect();
-                    composite.evaluate(&inputs, host)
+                    composite.evaluate_checked(&inputs, host)
                 }
             };
             if let Some(node) = self.node_mut(id) {
                 node.outputs = outputs;
+                node.issues = issues;
             }
         }
     }
 
-    fn evaluate_op(&self, id: NodeId, spec: &'static Spec, host: &dyn Host) -> BTreeMap<String, Value> {
+    fn evaluate_op(
+        &self,
+        id: NodeId,
+        spec: &'static Spec,
+        host: &dyn Host,
+    ) -> (BTreeMap<String, Value>, Vec<Issue>) {
         let args: Vec<Value> = spec
             .inputs
             .iter()
             .map(|input| self.input(&Port { node: id, field: input.name.to_owned() }))
             .collect();
         let scalar: Vec<bool> = spec.inputs.iter().map(|input| !input.list).collect();
+        let mut issues = std::collections::BTreeSet::new();
         let values = value::lace(&args, &scalar, spec.outputs.len(), &mut |args| {
-            (spec.eval)(args, host)
+            let result = (spec.eval)(args, host);
+            if !result.is_empty() && result.iter().all(Value::is_null) && issues.len() < MAX_ISSUES {
+                issues.insert(diagnose(spec, args));
+            }
+            result
         });
-        spec.outputs
+        let outputs = spec.outputs
             .iter()
             .map(|name| (*name).to_owned())
             .zip(values)
-            .collect()
+            .collect();
+        (outputs, issues.into_iter().collect())
     }
 
     fn evaluate_object(&self, id: NodeId, kind: &str, host: &mut dyn Host) -> BTreeMap<String, Value> {

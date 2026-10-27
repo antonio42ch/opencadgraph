@@ -424,6 +424,134 @@ pub fn outline(left: &Curve, right: &Curve) -> Option<Curve> {
     Some(polyline(&chain, EPSILON))
 }
 
+/// Whether `point` is inside the region `rings` bound, by the even-odd rule.
+fn inside(rings: &[Vec<[f64; 2]>], point: [f64; 2]) -> bool {
+    let mut crossings = 0;
+    for ring in rings {
+        for k in 0..ring.len() {
+            let (a, b) = (ring[k], ring[(k + 1) % ring.len()]);
+            if (a[1] > point[1]) != (b[1] > point[1]) {
+                let x = a[0] + (point[1] - a[1]) / (b[1] - a[1]) * (b[0] - a[0]);
+                if x > point[0] {
+                    crossings += 1;
+                }
+            }
+        }
+    }
+    crossings % 2 == 1
+}
+
+/// The regions `keep` picks out of the closed curves `a` and `b`, given
+/// whether a point is inside each: union, difference and intersection
+/// alike. Each region is its outline, counter-clockwise, then its holes,
+/// clockwise; arcs come back as straight chords.
+pub fn boolean(a: &[Curve], b: &[Curve], keep: fn(bool, bool) -> bool) -> Vec<Vec<Curve>> {
+    // About 1.8° per chord: arcs stay round at drawing scale.
+    let ring = |shape: &Curve| {
+        let mut points = shape.tessellate(32.0);
+        if points.len() > 1 && near(points[0], points[points.len() - 1], EPSILON) {
+            points.pop();
+        }
+        points
+    };
+    let (rings_a, rings_b): (Vec<_>, Vec<_>) = (a.iter().map(ring).collect(), b.iter().map(ring).collect());
+    let segments: Vec<Line> = rings_a
+        .iter()
+        .chain(&rings_b)
+        .flat_map(|ring| (0..ring.len()).map(move |k| Line { start: ring[k], end: ring[(k + 1) % ring.len()] }))
+        .filter(|line| !near(line.start, line.end, EPSILON))
+        .collect();
+    let faces = kernel::geom2d::arrangement::bounded_faces(&segments, kernel::geom2d::Tolerance::new(1e-9));
+    // Every edge of the arrangement bounds some face. One is kept where the
+    // region lies on exactly one side of it, turned to have it on its left.
+    let mut seen = std::collections::HashSet::new();
+    let mut kept = Vec::new();
+    let key = |p: [f64; 2]| ((p[0] * 1e7).round() as i64, (p[1] * 1e7).round() as i64);
+    for face in &faces {
+        for k in 0..face.len() {
+            let (p, q) = (face[k], face[(k + 1) % face.len()]);
+            let length = (q[0] - p[0]).hypot(q[1] - p[1]);
+            let (kp, kq) = (key(p), key(q));
+            if length <= EPSILON || !seen.insert((kp.min(kq), kp.max(kq))) {
+                continue;
+            }
+            let eps = (length * 1e-4).clamp(1e-9, 1e-4);
+            let middle = [(p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0];
+            let normal = [-(q[1] - p[1]) / length * eps, (q[0] - p[0]) / length * eps];
+            let side = |sign: f64| {
+                let point = [middle[0] + sign * normal[0], middle[1] + sign * normal[1]];
+                keep(inside(&rings_a, point), inside(&rings_b, point))
+            };
+            match (side(1.0), side(-1.0)) {
+                (true, false) => kept.push(Piece { start: p, end: q, bulge: 0.0 }),
+                (false, true) => kept.push(Piece { start: q, end: p, bulge: 0.0 }),
+                _ => {}
+            }
+        }
+    }
+    regions_of(chain_rings(kept))
+}
+
+/// Outlines gathered into regions: each counter-clockwise outline first,
+/// then the clockwise holes whose smallest enclosing outline it is.
+fn regions_of(outlines: Vec<Curve>) -> Vec<Vec<Curve>> {
+    let corners = |shape: &Curve| match shape {
+        Curve::Polyline(polyline) => polyline.vertices.iter().map(|v| v.position).collect(),
+        _ => Vec::new(),
+    };
+    let (outer, holes): (Vec<Curve>, Vec<Curve>) =
+        outlines.into_iter().partition(|shape| shape.enclosed_area() > 0.0);
+    let mut regions: Vec<Vec<Curve>> = outer.into_iter().map(|shape| vec![shape]).collect();
+    for hole in holes {
+        let Some(&probe) = corners(&hole).first() else {
+            continue;
+        };
+        let home = regions
+            .iter_mut()
+            .filter(|region| inside(&[corners(&region[0])], probe))
+            .min_by(|a, b| a[0].enclosed_area().total_cmp(&b[0].enclosed_area()));
+        match home {
+            Some(region) => region.push(hole),
+            None => regions.push(vec![hole]),
+        }
+    }
+    regions
+}
+
+/// Directed edges joined head to tail into closed polylines, with the
+/// vertices along straight runs dropped.
+fn chain_rings(mut edges: Vec<Piece>) -> Vec<Curve> {
+    let mut rings = Vec::new();
+    while let Some(first) = edges.pop() {
+        let mut chain = vec![first];
+        while !near(chain[chain.len() - 1].end, chain[0].start, 1e-7) {
+            let end = chain[chain.len() - 1].end;
+            let Some(k) = edges.iter().position(|edge| near(edge.start, end, 1e-7)) else {
+                break;
+            };
+            chain.push(edges.swap_remove(k));
+        }
+        let mut points: Vec<[f64; 2]> = chain.iter().map(|piece| piece.start).collect();
+        // Drop vertices between two collinear edges.
+        let mut k = 0;
+        while points.len() > 3 && k < points.len() {
+            let n = points.len();
+            let (a, b, c) = (points[(k + n - 1) % n], points[k], points[(k + 1) % n]);
+            let turn = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]);
+            let scale = (b[0] - a[0]).hypot(b[1] - a[1]) * (c[0] - b[0]).hypot(c[1] - b[1]);
+            if turn.abs() <= 1e-9 * scale.max(EPSILON) {
+                points.remove(k);
+            } else {
+                k += 1;
+            }
+        }
+        if points.len() >= 3 {
+            rings.push(closed_polyline(&points));
+        }
+    }
+    rings
+}
+
 /// `shape` run the other way. A circle has no stored direction and comes
 /// back as it is; an arc, which always runs counter-clockwise, comes back as
 /// the one-segment polyline that runs it clockwise.

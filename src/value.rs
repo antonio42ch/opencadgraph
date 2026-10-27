@@ -306,3 +306,33 @@ mod tests {
         assert!(curve(&json!({"x":1,"y":2})).is_none());
     }
 }
+
+/// A table's rows: a list of lists, or text with a row per line and cells
+/// split by tabs, semicolons or commas (the first of them the text holds).
+/// Cells that read as numbers become numbers.
+pub fn table(value: &Value) -> Vec<Vec<Value>> {
+    let cell = |item: &Value| match item {
+        Value::String(text) => text
+            .trim()
+            .parse::<f64>()
+            .map_or_else(|_| Value::String(text.trim().to_owned()), number),
+        other => other.clone(),
+    };
+    match value {
+        Value::Array(rows) => rows
+            .iter()
+            .map(|row| match row {
+                Value::Array(cells) => cells.iter().map(cell).collect(),
+                other => vec![cell(other)],
+            })
+            .collect(),
+        Value::String(text) => {
+            let separator = ['\t', ';', ','].into_iter().find(|c| text.contains(*c)).unwrap_or(',');
+            text.lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(|line| line.split(separator).map(|item| cell(&Value::String(item.to_owned()))).collect())
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}

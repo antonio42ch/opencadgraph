@@ -143,6 +143,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("Boolean", "bool -> bool", "A true or false switch."),
     ("Formula", "text, number*4 -> number", "Evaluates an arithmetic expression of a, b, c and d, such as a*2+b."),
     ("Watch", "any -> any", "Shows the value it receives and passes it on unchanged."),
+    ("Table", "any[], bool -> any[]*9, number", "A table typed or pasted by hand: each column comes out as a list, the rows as a list of lists, and the count of rows. With header, the first row names the columns."),
     // ── Math ─────────────────────────────────────────────────────────────
     ("Add", "number*2 -> number", "a + b."),
     ("Subtract", "number*2 -> number", "a − b."),
@@ -187,6 +188,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("Xor", "bool*2 -> bool", "True when exactly one of a and b is true."),
     ("Not", "bool -> bool", "The opposite of a."),
     ("If", "bool, any*2 -> any", "Passes on then when the test is true, else otherwise."),
+    ("Choose", "number, any*5 -> any", "The option at an index, counting from 0: one of several values, curves or lists picked by a number."),
     // ── List ─────────────────────────────────────────────────────────────
     ("Range", "number*3, bool -> number[]", "Numbers from start to end in steps; include end adds the end when the steps fall short of it."),
     ("Sequence", "number*3 -> number[]", "A count of numbers from start, in steps."),
@@ -268,6 +270,9 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("Extend Curve", "curve, number*2 -> curve", "The curve lengthened at its start and its end by the given lengths."),
     ("Fillet Corners", "curve, number -> curve", "The curve with its corners rounded with arcs of a radius."),
     ("Offset Both Sides", "curve, number -> curve, curve*2", "The two parallels of a curve at half a width to each side, and the closed outline between them: a wall, a path or a trench from its axis. A closed curve gives both sides as its outline."),
+    ("Region Union", "curve[]*2 -> curve[], number", "Everything the closed curves of a and b cover, as regions (each its outline and its holes), and its area: walls that meet, merged."),
+    ("Region Difference", "curve[]*2 -> curve[], number", "What the closed curves of a cover and those of b do not, as regions (each its outline and its holes), and its area: a slab less its openings."),
+    ("Region Intersection", "curve[]*2 -> curve[], number", "What the closed curves of a and of b both cover, as regions (each its outline and its holes), and its area."),
     ("Sub Curve", "curve, number*2 -> curve", "The part of a curve between two distances along it."),
     ("Split At Distances", "curve, number[] -> curve[]*3", "Cuts a curve at distances along it: every piece, and the even (1st, 3rd…) and odd (2nd, 4th…) pieces apart, such as wall stretches and openings."),
     ("Closest Point", "curve, point -> point, number*2", "The point of a curve nearest to a point, its parameter t and the distance to it."),

@@ -87,6 +87,15 @@ impl Composite {
         inputs: &BTreeMap<String, Value>,
         host: &mut dyn crate::Host,
     ) -> BTreeMap<String, Value> {
+        self.evaluate_checked(inputs, host).0
+    }
+
+    /// [`evaluate`](Self::evaluate), with the issues of the steps inside.
+    pub fn evaluate_checked(
+        &self,
+        inputs: &BTreeMap<String, Value>,
+        host: &mut dyn crate::Host,
+    ) -> (BTreeMap<String, Value>, Vec<crate::Issue>) {
         let mut inner = self.graph.clone();
         for (name, port) in &self.inputs {
             if let (Some(value), Some(node)) = (inputs.get(name), inner.node_mut(port.node)) {
@@ -94,7 +103,23 @@ impl Composite {
             }
         }
         inner.evaluate(host);
-        self.outputs
+        let issues = inner
+            .nodes
+            .iter()
+            .flat_map(|node| {
+                let step = match &node.kind {
+                    Kind::Op(spec) => spec.name.to_owned(),
+                    Kind::Composite(composite) => composite.name.clone(),
+                    Kind::Object(name) => name.clone(),
+                };
+                node.issues
+                    .iter()
+                    .map(move |issue| crate::Issue::Inner(step.clone(), Box::new(issue.clone())))
+            })
+            .take(crate::MAX_ISSUES)
+            .collect();
+        let outputs = self
+            .outputs
             .iter()
             .map(|(name, port)| {
                 let value = inner
@@ -104,7 +129,8 @@ impl Composite {
                     .unwrap_or(Value::Null);
                 (name.clone(), value)
             })
-            .collect()
+            .collect();
+        (outputs, issues)
     }
 
     pub fn to_json(&self) -> Value {
@@ -418,6 +444,33 @@ mod tests {
             node,
             field: field.to_owned(),
         }
+    }
+
+    #[test]
+    fn nodes_say_why_they_give_nothing() {
+        let mut graph = Graph::default();
+        let line = graph.add(Kind::Op(spec("Line Curve").unwrap()));
+        let circle = graph.add(Kind::Op(spec("Circle Curve").unwrap()));
+        let count = graph.add(Kind::Op(spec("Sum").unwrap()));
+        graph.node_mut(circle).unwrap().params.insert("radius".into(), json!(-1));
+        graph.node_mut(circle).unwrap().params.insert("center".into(), json!({"x": 0, "y": 0, "z": 0}));
+        graph.node_mut(count).unwrap().params.insert("list".into(), json!([1, 2]));
+        graph.evaluate(&mut NoDrawing);
+        let issues = |id: NodeId| graph.node(id).unwrap().issues.clone();
+        assert_eq!(issues(line), vec![crate::Issue::Missing("start".into())]);
+        assert_eq!(issues(circle), vec![crate::Issue::NoResult]);
+        assert!(issues(count).is_empty());
+        assert_eq!(crate::Issue::Missing("start".into()).message(), "Nothing feeds start");
+
+        // A composite reports the issues of its steps.
+        let id = graph
+            .extract(&[circle], "Ring", &|port: &Port| port.field.clone(), Value::Null)
+            .unwrap();
+        graph.evaluate(&mut NoDrawing);
+        assert_eq!(
+            graph.node(id).unwrap().issues,
+            vec![crate::Issue::Inner("Circle Curve".into(), Box::new(crate::Issue::NoResult))]
+        );
     }
 
     /// width → (Add width+1) → (Multiply ×2) → Negate
