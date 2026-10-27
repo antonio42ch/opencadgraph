@@ -322,6 +322,108 @@ pub fn join(shapes: &[PlanarCurve], tolerance: f64) -> Vec<PlanarCurve> {
         .collect()
 }
 
+/// A piece as a curve of its own, to measure and walk along.
+fn piece_curve(piece: &Piece) -> Curve {
+    Curve::Polyline(Polyline {
+        vertices: vec![
+            PolylineVertex {
+                position: piece.start,
+                bulge: piece.bulge,
+            },
+            PolylineVertex::straight(piece.end),
+        ],
+        closed: false,
+    })
+}
+
+/// The part of `piece` from fraction `u0` to `u1` of its length.
+fn piece_part(piece: &Piece, u0: f64, u1: f64) -> Piece {
+    let shape = piece_curve(piece);
+    let length = shape.length();
+    let sweep = 4.0 * piece.bulge.atan();
+    Piece {
+        start: shape.point_at_distance(length * u0),
+        end: shape.point_at_distance(length * u1),
+        bulge: (sweep * (u1 - u0) / 4.0).tan(),
+    }
+}
+
+/// The part of `shape` between arc lengths `from` and `to` along it, in
+/// either order, clamped to the curve; `None` when nothing is left.
+/// Circles start at angle 0; unbounded curves, ellipses and splines give
+/// `None`.
+pub fn sub_curve(shape: &Curve, from: f64, to: f64) -> Option<Curve> {
+    let total = shape.length();
+    if !total.is_finite() {
+        return None;
+    }
+    let (from, to) = (from.min(to).max(0.0), from.max(to).min(total));
+    if to - from <= EPSILON {
+        return None;
+    }
+    match shape {
+        Curve::Line(_) => Some(Curve::Line(Line {
+            start: shape.point_at_distance(from),
+            end: shape.point_at_distance(to),
+        })),
+        Curve::Arc(arc) => Some(Curve::Arc(Arc {
+            start_angle: arc.start_angle + from / arc.radius,
+            end_angle: arc.start_angle + to / arc.radius,
+            ..*arc
+        })),
+        Curve::Circle(circle) => Some(Curve::Arc(Arc {
+            centre: circle.centre,
+            radius: circle.radius,
+            start_angle: from / circle.radius,
+            end_angle: to / circle.radius,
+        })),
+        _ => {
+            let mut chain = Vec::new();
+            let mut start = 0.0;
+            for piece in pieces(shape)? {
+                let length = piece_curve(&piece).length();
+                let end = start + length;
+                let (a, b) = (from.max(start), to.min(end));
+                if length > EPSILON && b - a > EPSILON {
+                    chain.push(piece_part(&piece, (a - start) / length, (b - start) / length));
+                }
+                start = end;
+            }
+            match chain.as_slice() {
+                [] => None,
+                [piece] if piece.bulge == 0.0 => Some(Curve::Line(Line {
+                    start: piece.start,
+                    end: piece.end,
+                })),
+                _ => Some(polyline(&chain, EPSILON)),
+            }
+        }
+    }
+}
+
+/// The closed outline between `left` and `right`, two parallels of one
+/// open curve running its way: along `left`, across its end, back along
+/// `right` and across its start.
+pub fn outline(left: &Curve, right: &Curve) -> Option<Curve> {
+    let left = pieces(left)?;
+    let right = pieces(right)?;
+    let (first, last) = (left.first()?, left.last()?);
+    let (back_first, back_last) = (right.first()?, right.last()?);
+    let mut chain = left.clone();
+    chain.push(Piece {
+        start: last.end,
+        end: back_last.end,
+        bulge: 0.0,
+    });
+    chain.extend(right.iter().rev().map(|piece| piece.reversed()));
+    chain.push(Piece {
+        start: back_first.start,
+        end: first.start,
+        bulge: 0.0,
+    });
+    Some(polyline(&chain, EPSILON))
+}
+
 /// `shape` run the other way. A circle has no stored direction and comes
 /// back as it is; an arc, which always runs counter-clockwise, comes back as
 /// the one-segment polyline that runs it clockwise.

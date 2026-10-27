@@ -791,6 +791,51 @@ pub const LIBRARY: &[Spec] = &[
             (Some(c), Some(d)) => offset(&c, d),
             _ => Value::Null,
         }) },
+    Spec { name: "Offset Both Sides", category: "Curve", inputs: &[v("curve"), n("width", 1.0)],
+        outputs: &["outline", "left", "right"],
+        eval: |a, host| match (curve_of(&a[0], host), num(&a[1])) {
+            (Some(c), Some(width)) if width > 0.0 => {
+                let (left, right) = (offset(&c, width / 2.0), offset(&c, -width / 2.0));
+                // A closed curve leaves a ring: its two sides are the outline.
+                let outline = match (curve(&left), curve(&right)) {
+                    (Some(_), Some(_)) if c.curve.is_closed() => Value::Array(vec![left.clone(), right.clone()]),
+                    (Some(l), Some(r)) => g::outline(&l.curve, &r.curve)
+                        .and_then(|shape| curve_value(&kernel::space::PlanarCurve::new(c.plane, shape)))
+                        .unwrap_or(Value::Null),
+                    _ => Value::Null,
+                };
+                vec![outline, left, right]
+            }
+            _ => vec![Value::Null; 3],
+        } },
+    Spec { name: "Sub Curve", category: "Curve", inputs: &[v("curve"), n("from", 0.0), n("to", 1.0)],
+        outputs: &["curve"],
+        eval: |a, host| {
+            let (from, to) = (num(&a[1]).unwrap_or(0.0), num(&a[2]).unwrap_or(0.0));
+            out(edit(&a[0], host, |shape| g::sub_curve(shape, from, to)))
+        } },
+    Spec { name: "Split At Distances", category: "Curve", inputs: &[v("curve"), l("distances")],
+        outputs: &["pieces", "even", "odd"],
+        eval: |a, host| match curve_of(&a[0], host) {
+            Some(c) => {
+                let total = c.length();
+                let mut cuts: Vec<f64> = list(&a[1]).iter().filter_map(num)
+                    .filter(|d| *d > 1e-9 && *d < total - 1e-9)
+                    .collect();
+                cuts.sort_by(f64::total_cmp);
+                cuts.dedup_by(|x, y| (*x - *y).abs() <= 1e-9);
+                let bounds: Vec<f64> = std::iter::once(0.0).chain(cuts).chain(std::iter::once(total)).collect();
+                let pieces: Vec<Value> = bounds.windows(2)
+                    .map(|span| g::sub_curve(&c.curve, span[0], span[1])
+                        .and_then(|shape| curve_value(&kernel::space::PlanarCurve::new(c.plane, shape)))
+                        .unwrap_or(Value::Null))
+                    .collect();
+                let every = |first: usize| Value::Array(pieces.iter().skip(first).step_by(2).cloned().collect());
+                let (even, odd) = (every(0), every(1));
+                vec![Value::Array(pieces), even, odd]
+            }
+            None => vec![Value::Null; 3],
+        } },
     // ── Vector ───────────────────────────────────────────────────────────
     // Vectors are written as points; planes as {"plane": …} (see value).
     Spec { name: "Vector", category: "Vector", inputs: &[n("x", 1.0), n("y", 0.0), n("z", 0.0)], outputs: &["vector"],
@@ -1053,6 +1098,48 @@ mod tests {
 
     fn p(x: f64, y: f64) -> Value {
         point_value([x, y, 0.0])
+    }
+
+    #[test]
+    fn curves_cut_at_distances_into_pieces_and_openings() {
+        // An L: 10 along x, then 10 up.
+        let path = run("Polyline Curve", &[json!([p(0.0, 0.0), p(10.0, 0.0), p(10.0, 10.0)]), json!(false)]).remove(0);
+        let corner = run("Sub Curve", &[path.clone(), json!(8.0), json!(12.0)]).remove(0);
+        assert!((length_of(&corner) - 4.0).abs() < 1e-9, "{corner}");
+        let ends = run("Curve Endpoints", &[corner]);
+        assert_eq!((point(&ends[0]), point(&ends[1])), (Some([8.0, 0.0, 0.0]), Some([10.0, 2.0, 0.0])));
+        let straight = run("Sub Curve", &[path.clone(), json!(2.0), json!(5.0)]).remove(0);
+        assert_eq!(straight["curve"], "line", "{straight}");
+
+        let split = run("Split At Distances", &[path, json!([14.0, 3.0, 4.0, 13.0, 99.0])]);
+        let lengths = |value: &Value| value.as_array().unwrap().iter().map(length_of).collect::<Vec<_>>();
+        let close = |got: Vec<f64>, want: &[f64]| {
+            got.len() == want.len() && got.iter().zip(want).all(|(x, y)| (x - y).abs() < 1e-9)
+        };
+        assert!(close(lengths(&split[0]), &[3.0, 1.0, 9.0, 1.0, 6.0]), "{}", split[0]);
+        assert!(close(lengths(&split[1]), &[3.0, 9.0, 6.0]), "{}", split[1]);
+        assert!(close(lengths(&split[2]), &[1.0, 1.0]), "{}", split[2]);
+
+        // Half of a quarter arc is an eighth of a turn.
+        let arc = run("Arc 3 Points", &[p(1.0, 0.0), p(0.5f64.sqrt(), 0.5f64.sqrt()), p(0.0, 1.0)]).remove(0);
+        let half = run("Sub Curve", &[arc, json!(0.0), json!(std::f64::consts::FRAC_PI_4)]).remove(0);
+        let end = point(&run("Curve Endpoints", &[half])[1]).unwrap();
+        assert!((end[0] - 0.5f64.sqrt()).abs() < 1e-9 && (end[1] - 0.5f64.sqrt()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn both_sides_of_an_axis_close_into_an_outline() {
+        let axis = run("Line Curve", &[p(0.0, 0.0), p(10.0, 0.0)]).remove(0);
+        let sides = run("Offset Both Sides", &[axis, json!(0.2)]);
+        let area = |value: &Value| num(&run("Curve Area", &[value.clone()])[0]).unwrap();
+        assert!((area(&sides[0]) - 2.0).abs() < 1e-9, "{}", sides[0]);
+        assert_eq!(sides[1]["start"], json!([0.0, 0.1]));
+        assert_eq!(sides[2]["start"], json!([0.0, -0.1]));
+        let path = run("Polyline Curve", &[json!([p(0.0, 0.0), p(10.0, 0.0), p(10.0, 10.0)]), json!(false)]).remove(0);
+        let outline = run("Offset Both Sides", &[path, json!(1.0)]).remove(0);
+        assert!((area(&outline) - 20.0).abs() < 1e-6, "{outline}");
+        let ring = run("Offset Both Sides", &[run("Circle Curve", &[p(0.0, 0.0), json!(5.0)]).remove(0), json!(1.0)]);
+        assert_eq!(ring[0].as_array().map(Vec::len), Some(2));
     }
 
     #[test]

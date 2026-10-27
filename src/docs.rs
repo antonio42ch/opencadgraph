@@ -267,6 +267,9 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("Close Curve", "curve -> curve", "The curve closed back to its start."),
     ("Extend Curve", "curve, number*2 -> curve", "The curve lengthened at its start and its end by the given lengths."),
     ("Fillet Corners", "curve, number -> curve", "The curve with its corners rounded with arcs of a radius."),
+    ("Offset Both Sides", "curve, number -> curve, curve*2", "The two parallels of a curve at half a width to each side, and the closed outline between them: a wall, a path or a trench from its axis. A closed curve gives both sides as its outline."),
+    ("Sub Curve", "curve, number*2 -> curve", "The part of a curve between two distances along it."),
+    ("Split At Distances", "curve, number[] -> curve[]*3", "Cuts a curve at distances along it: every piece, and the even (1st, 3rd…) and odd (2nd, 4th…) pieces apart, such as wall stretches and openings."),
     ("Closest Point", "curve, point -> point, number*2", "The point of a curve nearest to a point, its parameter t and the distance to it."),
     // ── Vector ───────────────────────────────────────────────────────────
     ("Vector", "number*3 -> vector", "A vector from its x, y and z components."),
