@@ -317,6 +317,38 @@ fn csv_text(rows: &[Value], separator: &str) -> String {
         .collect()
 }
 
+/// Whether operation `name` computes from its inputs alone: the others
+/// read the drawing or files, or write files, so they run every time.
+pub fn is_pure(name: &str) -> bool {
+    !matches!(name, "Layer Objects" | "Object Data" | "Read CSV" | "Write CSV")
+}
+
+/// A grade line from PVI points (x the station, y the elevation) and the
+/// vertical curve length at each.
+fn alignment(pvis: &Value, lengths: &Value) -> Option<crate::profile::Alignment> {
+    let pvis: Vec<[f64; 2]> = list(pvis).iter().filter_map(point).map(|p| [p[0], p[1]]).collect();
+    crate::profile::Alignment::new(&pvis, &numbers(lengths))
+}
+
+/// A profile point `(station, elevation)` in drawing space: the grid's
+/// origin at `start` and `datum`, elevations stretched `exaggeration` times.
+fn to_profile(p: [f64; 3], origin: [f64; 3], start: f64, datum: f64, exaggeration: f64) -> [f64; 3] {
+    [origin[0] + p[0] - start, origin[1] + (p[1] - datum) * exaggeration, origin[2]]
+}
+
+/// The values from `from` to `to` every `step`, ending on `to`.
+fn steps(from: f64, to: f64, step: f64) -> Vec<f64> {
+    if step <= 0.0 || to < from {
+        return vec![from];
+    }
+    let count = (((to - from) / step + 1e-9) as usize).min(MAX_ITEMS);
+    let mut values: Vec<f64> = (0..=count).map(|k| from + step * k as f64).collect();
+    if values.last().is_some_and(|last| to - last > 1e-9) {
+        values.push(to);
+    }
+    values
+}
+
 /// Columns a Table node gives apart.
 const TABLE_COLUMNS: usize = 8;
 
@@ -936,6 +968,25 @@ pub const LIBRARY: &[Spec] = &[
         inputs: &[s("template", "P-{a:00}"), v("a"), v("b"), v("c"), v("d")], outputs: RESULT,
         eval: |a, _| out(Value::String(format_text(&text(&a[0]), &a[1..]))) },
     // ── Geometry ─────────────────────────────────────────────────────────
+    Spec { name: "Slopes", category: "Geometry", inputs: &[l("points")], outputs: &["percent", "ratio", "angle", "run"],
+        eval: |a, _| {
+            let points: Vec<[f64; 3]> = list(&a[0]).iter().filter_map(point).collect();
+            let pairs: Vec<(f64, f64)> = points.windows(2).map(|w| (w[1][0] - w[0][0], w[1][1] - w[0][1])).collect();
+            let ratio = |(run, rise): &(f64, f64)| if run.abs() > 1e-12 { number(rise / run) } else { Value::Null };
+            vec![
+                Value::Array(pairs.iter().map(|pair| ratio(pair).as_f64().map_or(Value::Null, |r| number(r * 100.0))).collect()),
+                Value::Array(pairs.iter().map(ratio).collect()),
+                Value::Array(pairs.iter().map(|(run, rise)| number(rise.atan2(*run).to_degrees())).collect()),
+                Value::Array(pairs.iter().map(|(run, _)| number(run.abs())).collect()),
+            ]
+        } },
+    Spec { name: "To Profile", category: "Geometry",
+        inputs: &[v("point"), v("origin"), n("start", 0.0), n("datum", 0.0), n("exaggeration", 10.0)], outputs: POINT,
+        eval: |a, _| out(match (point(&a[0]), num(&a[2]), num(&a[3]), num(&a[4])) {
+            (Some(p), Some(start), Some(datum), Some(k)) =>
+                point_value(to_profile(p, point(&a[1]).unwrap_or_default(), start, datum, k)),
+            _ => Value::Null,
+        }) },
     Spec { name: "Layer Objects", category: "Geometry", inputs: &[s("layer", "0"), s("type", "")],
         outputs: &["objects", "curves", "count"],
         eval: |a, host| {
@@ -1307,6 +1358,63 @@ pub const LIBRARY: &[Spec] = &[
             let radius = num(&a[1]).unwrap_or(0.0);
             out(edit(&a[0], host, |shape| g::fillet(shape, radius)))
         } },
+    Spec { name: "Vertical Alignment", category: "Curve", inputs: &[l("pvis"), l("lengths"), n("step", 10.0)],
+        outputs: &["points", "grades", "pvc", "pvt", "k"],
+        eval: |a, _| {
+            let Some(line) = alignment(&a[0], &a[1]) else {
+                return vec![Value::Null; 5];
+            };
+            let curves = line.curves();
+            let curve_points = |pick: fn((f64, f64, f64)) -> f64| Value::Array(curves.iter()
+                .flatten()
+                .map(|curve| { let x = pick(*curve); point_value([x, line.at(x).0, 0.0]) })
+                .collect());
+            vec![
+                Value::Array(line.stations(num(&a[2]).unwrap_or(0.0))
+                    .into_iter()
+                    .map(|x| point_value([x, line.at(x).0, 0.0]))
+                    .collect()),
+                Value::Array(line.grades().into_iter().map(|g| number(g * 100.0)).collect()),
+                curve_points(|c| c.0),
+                curve_points(|c| c.1),
+                Value::Array(curves.iter().map(|curve| curve.map_or(Value::Null, |c| number(c.2))).collect()),
+            ]
+        } },
+    Spec { name: "Elevation At", category: "Curve", inputs: &[l("pvis"), l("lengths"), n("station", 0.0)],
+        outputs: &["elevation", "grade", "point"],
+        eval: |a, _| match (alignment(&a[0], &a[1]), num(&a[2])) {
+            (Some(line), Some(x)) => {
+                let (y, grade) = line.at(x);
+                vec![number(y), number(grade * 100.0), point_value([x, y, 0.0])]
+            }
+            _ => vec![Value::Null; 3],
+        } },
+    Spec { name: "Profile Grid", category: "Curve",
+        inputs: &[v("origin"), n("start", 0.0), n("end", 100.0), n("station step", 20.0), n("datum", 0.0),
+            n("top", 10.0), n("elevation step", 1.0), n("exaggeration", 10.0)],
+        outputs: &["lines", "stations", "station points", "elevations", "elevation points"],
+        eval: |a, _| {
+            let [start, end, station_step, datum, top, elevation_step, k] =
+                [1, 2, 3, 4, 5, 6, 7].map(|i| num(&a[i]).unwrap_or(0.0));
+            if end <= start || top <= datum {
+                return vec![Value::Null; 5];
+            }
+            let origin = point(&a[0]).unwrap_or_default();
+            let at = |x: f64, y: f64| to_profile([x, y, 0.0], origin, start, datum, k);
+            let line = |p: [f64; 3], q: [f64; 3]| {
+                flat_curve(p[2], kernel::geom2d::Curve::Line(kernel::geom2d::Line { start: [p[0], p[1]], end: [q[0], q[1]] }))
+            };
+            let (stations, elevations) = (steps(start, end, station_step), steps(datum, top, elevation_step));
+            let mut lines: Vec<Value> = stations.iter().map(|x| line(at(*x, datum), at(*x, top))).collect();
+            lines.extend(elevations.iter().map(|y| line(at(start, *y), at(end, *y))));
+            vec![
+                Value::Array(lines),
+                Value::Array(stations.iter().map(|x| number(*x)).collect()),
+                Value::Array(stations.iter().map(|x| point_value(at(*x, datum))).collect()),
+                Value::Array(elevations.iter().map(|y| number(*y)).collect()),
+                Value::Array(elevations.iter().map(|y| point_value(at(start, *y))).collect()),
+            ]
+        } },
     Spec { name: "Distance Along Curve", category: "Curve", inputs: &[v("curve"), v("point")],
         outputs: &["distance", "offset", "point", "angle"],
         eval: |a, host| match (curve_of(&a[0], host), point(&a[1])) {
@@ -1578,6 +1686,58 @@ mod tests {
         let unknown = formula_issue(spec("Filter").unwrap(), &[json!([]), json!("q > 1")]);
         assert_eq!(unknown.as_deref(), Some("unknown name `q`"));
         assert_eq!(formula_issue(spec("Filter").unwrap(), &[json!([]), json!("x > i")]), None);
+    }
+
+    #[test]
+    fn unchanged_steps_keep_their_results() {
+        let mut graph = crate::Graph::default();
+        let a = graph.add(crate::Kind::Op(spec("Number").unwrap()));
+        let negate = graph.add(crate::Kind::Op(spec("Negate").unwrap()));
+        let layer = graph.add(crate::Kind::Op(spec("Layer Objects").unwrap()));
+        let port = |node, field: &str| crate::Port { node, field: field.to_owned() };
+        graph.connect(port(a, "value"), port(negate, "x"));
+        graph.node_mut(a).unwrap().params.insert("value".into(), json!(2));
+        graph.evaluate(&mut NoDrawing);
+        assert_eq!(graph.node(negate).unwrap().outputs["result"], json!(-2.0));
+        // A marked result survives a run with the same inputs…
+        for id in [negate, layer] {
+            graph.node_mut(id).unwrap().outputs.insert("mark".into(), json!(true));
+        }
+        graph.evaluate(&mut NoDrawing);
+        assert!(graph.node(negate).unwrap().outputs.contains_key("mark"));
+        // …but not a step that reads the drawing, nor a changed input.
+        assert!(!graph.node(layer).unwrap().outputs.contains_key("mark"));
+        graph.node_mut(a).unwrap().params.insert("value".into(), json!(5));
+        graph.evaluate(&mut NoDrawing);
+        assert_eq!(graph.node(negate).unwrap().outputs["result"], json!(-5.0));
+        assert!(!graph.node(negate).unwrap().outputs.contains_key("mark"));
+        graph.node_mut(negate).unwrap().outputs.insert("mark".into(), json!(true));
+        graph.invalidate();
+        graph.evaluate(&mut NoDrawing);
+        assert!(!graph.node(negate).unwrap().outputs.contains_key("mark"));
+    }
+
+    #[test]
+    fn profiles_draw_grades_curves_and_grids() {
+        let slopes = run("Slopes", &[json!([p(0.0, 10.0), p(50.0, 11.0), p(100.0, 11.0)])]);
+        assert_eq!(slopes[0], json!([2.0, 0.0]));
+        assert_eq!(slopes[3], json!([50.0, 50.0]));
+
+        let pvis = json!([p(0.0, 10.0), p(100.0, 12.0), p(200.0, 10.0)]);
+        let line = run("Vertical Alignment", &[pvis.clone(), json!([0, 100, 0]), json!(50)]);
+        assert_eq!(line[1], json!([2.0, -2.0]));
+        assert_eq!(line[2], json!([p(50.0, 11.0)]));
+        assert_eq!(line[4], json!([null, 25.0, null]));
+        assert_eq!(list(&line[0]).len(), 5, "0, 50, 100, 150, 200");
+        let top = run("Elevation At", &[pvis, json!([0, 100, 0]), json!(100)]);
+        assert_eq!((top[0].clone(), top[1].clone()), (json!(11.5), json!(0.0)));
+
+        let placed = run("To Profile", &[p(120.0, 12.5), p(0.0, 0.0), json!(100), json!(10), json!(10)]);
+        assert_eq!(placed[0], p(20.0, 25.0));
+        let grid = run("Profile Grid", &[p(0.0, 0.0), json!(0), json!(50), json!(20), json!(10), json!(12), json!(1), json!(10)]);
+        assert_eq!(grid[1], json!([0.0, 20.0, 40.0, 50.0]), "ends on the end station");
+        assert_eq!(list(&grid[0]).len(), 4 + 3);
+        assert_eq!(list(&grid[4])[2], p(0.0, 20.0));
     }
 
     #[test]

@@ -32,6 +32,15 @@ pub struct Composite {
 }
 
 impl Composite {
+    /// Whether every step inside computes from its inputs alone.
+    pub fn is_pure(&self) -> bool {
+        self.graph.nodes.iter().all(|node| match &node.kind {
+            crate::Kind::Op(spec) => crate::ops::is_pure(spec.name),
+            crate::Kind::Composite(inner) => inner.is_pure(),
+            crate::Kind::Object(_) => false,
+        })
+    }
+
     /// Checks that the ports exist and the inner graph holds no host
     /// objects.
     pub fn new(

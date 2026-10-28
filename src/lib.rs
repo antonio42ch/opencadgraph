@@ -11,6 +11,7 @@ pub mod docs;
 pub mod expr;
 pub mod geometry;
 pub mod ops;
+pub mod profile;
 pub mod value;
 
 use std::collections::BTreeMap;
@@ -96,6 +97,9 @@ pub struct Node {
     pub outputs: BTreeMap<String, Value>,
     /// Why the last evaluation gave no result, once per reason.
     pub issues: Vec<Issue>,
+    /// What the outputs were last computed from, for a node whose result
+    /// depends on its inputs alone: while it holds, evaluation skips it.
+    pub memo: Option<u64>,
 }
 
 /// Why an operation gave no result for a set of values.
@@ -125,6 +129,28 @@ impl Issue {
             Issue::Formula(why) => format!("The formula does not read: {why}"),
         }
     }
+}
+
+/// Whether `value` names a drawn object anywhere inside it: what an
+/// operation computes from one follows the drawing, not its inputs alone.
+fn holds_object(value: &Value) -> bool {
+    match value {
+        Value::Array(items) => items.iter().any(holds_object),
+        Value::Object(object) => object.contains_key("handle"),
+        _ => false,
+    }
+}
+
+/// A hash of what a node computes from: its type and its input values.
+fn memo_key(name: &str, salt: usize, args: &[Value]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    name.hash(&mut hasher);
+    salt.hash(&mut hasher);
+    for arg in args {
+        arg.to_string().hash(&mut hasher);
+    }
+    hasher.finish()
 }
 
 /// At most this many issues are kept per node.
@@ -179,6 +205,7 @@ impl Graph {
             params,
             outputs: BTreeMap::new(),
             issues: Vec::new(),
+            memo: None,
         });
         self.next_id
     }
@@ -345,44 +372,72 @@ impl Graph {
     }
 
     /// Evaluates every node, upstream first.
+    /// Runs every node in dataflow order. An operation or composite whose
+    /// inputs are what they were last time, and that reads nothing from the
+    /// host, keeps its outputs without running again.
     pub fn evaluate(&mut self, host: &mut dyn Host) {
         for id in self.order() {
             let Some(kind) = self.node(id).map(|node| node.kind.clone()) else {
                 continue;
             };
-            let (outputs, issues) = match kind {
-                Kind::Op(spec) => self.evaluate_op(id, spec, host),
-                Kind::Object(kind) => (self.evaluate_object(id, &kind, host), Vec::new()),
+            let memo = self.node(id).and_then(|node| node.memo);
+            let (outputs, issues, key) = match kind {
+                Kind::Op(spec) => {
+                    let args: Vec<Value> = spec
+                        .inputs
+                        .iter()
+                        .map(|input| self.input(&Port { node: id, field: input.name.to_owned() }))
+                        .collect();
+                    let key = (ops::is_pure(spec.name) && !args.iter().any(holds_object))
+                        .then(|| memo_key(spec.name, 0, &args));
+                    if key.is_some() && key == memo {
+                        continue;
+                    }
+                    let (outputs, issues) = self.evaluate_op(spec, &args, host);
+                    (outputs, issues, key)
+                }
+                Kind::Object(kind) => (self.evaluate_object(id, &kind, host), Vec::new(), None),
                 Kind::Composite(composite) => {
-                    let inputs = composite
+                    let inputs: BTreeMap<String, Value> = composite
                         .inputs
                         .iter()
                         .map(|(name, _)| (name.clone(), self.input(&Port { node: id, field: name.clone() })))
                         .collect();
-                    composite.evaluate_checked(&inputs, host)
+                    let args: Vec<Value> = inputs.values().cloned().collect();
+                    // An edited composite is a new one, at a new address.
+                    let key = (composite.is_pure() && !args.iter().any(holds_object))
+                        .then(|| memo_key(&composite.name, std::sync::Arc::as_ptr(&composite) as usize, &args));
+                    if key.is_some() && key == memo {
+                        continue;
+                    }
+                    let (outputs, issues) = composite.evaluate_checked(&inputs, host);
+                    (outputs, issues, key)
                 }
             };
             if let Some(node) = self.node_mut(id) {
                 node.outputs = outputs;
                 node.issues = issues;
+                node.memo = key;
             }
+        }
+    }
+
+    /// Forgets every node's memo, so the next evaluation runs them all.
+    pub fn invalidate(&mut self) {
+        for node in &mut self.nodes {
+            node.memo = None;
         }
     }
 
     fn evaluate_op(
         &self,
-        id: NodeId,
         spec: &'static Spec,
+        args: &[Value],
         host: &dyn Host,
     ) -> (BTreeMap<String, Value>, Vec<Issue>) {
-        let args: Vec<Value> = spec
-            .inputs
-            .iter()
-            .map(|input| self.input(&Port { node: id, field: input.name.to_owned() }))
-            .collect();
         let scalar: Vec<bool> = spec.inputs.iter().map(|input| !input.list).collect();
         let mut issues = std::collections::BTreeSet::new();
-        let values = value::lace(&args, &scalar, spec.outputs.len(), &mut |args| {
+        let values = value::lace(args, &scalar, spec.outputs.len(), &mut |args| {
             let result = (spec.eval)(args, host);
             if !result.is_empty() && result.iter().all(Value::is_null) && issues.len() < MAX_ISSUES {
                 issues.insert(diagnose(spec, args));

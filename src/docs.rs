@@ -246,6 +246,8 @@ const TABLE: &[(&str, &str, &str)] = &[
     // ── Geometry ─────────────────────────────────────────────────────────
     ("Point", "number*3 -> point", "A point from its x, y and z coordinates."),
     ("Layer Objects", "text*2 -> object[], curve[], number", "The drawn objects on a layer, of a type such as Line or Circle when one is given, read again each time the graph runs: the objects, their curves and how many there are. Objects the graph draws itself are left out."),
+    ("Slopes", "point[] -> number[]*4", "The slope between each point and the next, as a percentage, a ratio (rise over run) and an angle in degrees, and the horizontal run: the grades of a profile or the falls of a pipe."),
+    ("To Profile", "point*2, number*3 -> point", "Places a profile point (x the station, y the elevation) on a profile drawing: its origin at the start station and the datum elevation, elevations stretched by the exaggeration, as Profile Grid draws them."),
     ("Object Data", "object, text -> any", "The data value an object carries under a key, as Tag Objects or a drawing node writes it; with no key, all of its data as key=value texts."),
     ("Point Components", "point -> number*3", "The x, y and z coordinates of a point."),
     ("Distance", "point*2 -> number", "The distance between two points."),
@@ -287,6 +289,9 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("Region Intersection", "curve[]*2 -> curve[], number", "What the closed curves of a and of b both cover, as regions (each its outline and its holes), and its area."),
     ("Sub Curve", "curve, number*2 -> curve", "The part of a curve between two distances along it."),
     ("Split At Distances", "curve, number[] -> curve[]*3", "Cuts a curve at distances along it: every piece, and the even (1st, 3rd…) and odd (2nd, 4th…) pieces apart, such as wall stretches and openings."),
+    ("Vertical Alignment", "point[], number[], number -> point[], number[], point[]*2, number[]", "A profile grade line through points of intersection (x the station, y the elevation) with a parabolic vertical curve of the given length at each: points along it every step and at every PVI, PVC and PVT, the grade of each tangent in percent, where each curve starts and ends, and each curve's K (its length per percent of grade change)."),
+    ("Elevation At", "point[], number[], number -> number*2, point", "The elevation and grade (percent) of a grade line with vertical curves at a station, as Vertical Alignment builds it, and the profile point there."),
+    ("Profile Grid", "point, number*7 -> curve[], number[], point[], number[], point[]", "The lines of a profile grid from a start to an end station and from a datum to a top elevation, at an origin, with elevations stretched by the exaggeration: the lines, the stations and the points under them for labels, the elevations and the points beside them."),
     ("Distance Along Curve", "curve, point -> number*2, point, number", "Where a point stands along a curve: the distance along it to the closest point (a station), the offset to its left (negative to its right), that closest point and the curve's angle there."),
     ("Closest Point", "curve, point -> point, number*2", "The point of a curve nearest to a point, its parameter t and the distance to it."),
     // ── Vector ───────────────────────────────────────────────────────────
