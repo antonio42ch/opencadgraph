@@ -354,6 +354,11 @@ fn call_op(name: &str, map: rhai::Map) -> Result<rhai::Dynamic, Box<rhai::EvalAl
 #[cfg(feature = "script")]
 fn op_output(name: &str, output: &str, map: rhai::Map) -> Result<rhai::Dynamic, Box<rhai::EvalAltResult>> {
     let result = call_op(name, map)?;
+    // An operation with one output gives it as is, a map only when the
+    // output is itself one (a point, a curve).
+    if crate::spec(name).is_some_and(|spec| spec.outputs.len() == 1) {
+        return Ok(result);
+    }
     let picked = result
         .read_lock::<rhai::Map>()
         .map(|outputs| outputs.get(output).cloned().unwrap_or(rhai::Dynamic::UNIT));
@@ -456,6 +461,33 @@ mod tests {
         assert!(issue.is_some(), "stopped");
         let shape = Script::new("S", "// outputs: a: number, b: number\n5");
         assert!(shape.evaluate(&[]).1.is_some_and(|why| why.contains("map of a, b")));
+    }
+
+    #[test]
+    fn helpers_give_curves_points_and_numbers() {
+        let source = r#"
+// outputs: line: curve, ring: curve, path: curve, side: curve, length: number, mid: point, angle: number
+let a = point(0.0, 0.0);
+let b = point(4, 3);
+let line = line(a, b);
+#{
+    line: line,
+    ring: circle(a, 2.0),
+    path: polyline([a, b, point(4.0, 0.0)], true),
+    side: offset(line, 1.0),
+    length: length(line),
+    mid: point_at(line, 2.5),
+    angle: angle_at(line, 0.0),
+}
+"#;
+        let (out, issue) = Script::new("S", source).evaluate(&[]);
+        assert_eq!(issue, None);
+        for k in 0..4 {
+            assert!(crate::value::curve(&out[k]).is_some(), "output {k}: {}", out[k]);
+        }
+        assert_eq!(out[4], json!(5.0));
+        assert_eq!(crate::value::point(&out[5]), Some([2.0, 1.5, 0.0]));
+        assert!((crate::value::num(&out[6]).unwrap() - 36.86989764584402).abs() < 1e-9);
     }
 
     #[test]

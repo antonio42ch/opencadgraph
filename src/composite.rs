@@ -421,6 +421,7 @@ impl Graph {
                 .iter()
                 .map(|(name, _)| name.clone())
                 .collect(),
+            Some(Kind::Script(script)) => script.outputs.iter().map(|port| port.name.clone()).collect(),
             _ => Vec::new(),
         }
     }
