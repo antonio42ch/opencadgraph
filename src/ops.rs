@@ -177,6 +177,79 @@ fn format_number(x: f64, decimals: usize, digits: usize, group: usize, separator
     result
 }
 
+/// The variables an Expression node gives its formula, in input order.
+const EXPRESSION_VARIABLES: &[&str] = &["a", "b", "c", "d", "x", "y"];
+
+/// Whether `item`, the `k`-th of `count`, passes a Filter condition. The
+/// condition reads the item as `x` (a number, or its length for a curve),
+/// a point's coordinates as `px`, `py` and `pz`, the item's index as `i` and
+/// the list's size as `n`. `None` when the condition does not read.
+fn item_test(condition: &str, item: &Value, k: usize, count: usize) -> Option<bool> {
+    let p = point(item);
+    let length = curve(item).map(|c| c.length());
+    let var = |name: &str| match name {
+        "x" => num(item).or(length).or(Some(f64::NAN)),
+        "i" => Some(k as f64),
+        "n" => Some(count as f64),
+        "px" => p.map(|p| p[0]),
+        "py" => p.map(|p| p[1]),
+        "pz" => p.map(|p| p[2]),
+        "length" => length,
+        _ => None,
+    };
+    crate::expr::eval(condition, &var).ok().map(crate::expr::Val::truth)
+}
+
+/// Fills `{a}`..`{d}` (or `{0}`..`{3}`) in `template` with `values`. A
+/// format after a colon pads and rounds numbers: `{a:000}` gives three
+/// integer digits, `{a:.2}` two decimals, `{a:0.00}` both. `{{` and `}}`
+/// write braces.
+fn format_text(template: &str, values: &[Value]) -> String {
+    let mut result = String::new();
+    let mut rest = template;
+    while let Some(start) = rest.find(['{', '}']) {
+        result.push_str(&rest[..start]);
+        let tail = &rest[start..];
+        if tail.starts_with("{{") || tail.starts_with("}}") {
+            result.push_str(&tail[..1]);
+            rest = &tail[2..];
+            continue;
+        }
+        let Some(end) = tail.find('}').filter(|_| tail.starts_with('{')) else {
+            result.push_str(&tail[..1]);
+            rest = &tail[1..];
+            continue;
+        };
+        let field = &tail[1..end];
+        let (name, format) = field.split_once(':').unwrap_or((field, ""));
+        let slot = match name.trim() {
+            "a" | "0" => Some(0),
+            "b" | "1" => Some(1),
+            "c" | "2" => Some(2),
+            "d" | "3" => Some(3),
+            _ => None,
+        };
+        match slot.and_then(|k| values.get(k)) {
+            Some(value) => {
+                let (whole, fraction) = format.split_once('.').unwrap_or((format, ""));
+                let padded = whole.chars().all(|c| c == '0') && fraction.chars().all(|c| c.is_ascii_digit());
+                match num(value).filter(|_| !format.is_empty() && padded) {
+                    Some(x) => {
+                        let decimals = fraction.parse::<usize>().ok().filter(|_| !fraction.starts_with('0'))
+                            .unwrap_or(fraction.len()).min(12);
+                        result.push_str(&format_number(x, decimals, whole.len().clamp(1, 32), 0, "", "."));
+                    }
+                    None => result.push_str(&text(value)),
+                }
+            }
+            None => result.push_str(&tail[..=end]),
+        }
+        rest = &tail[end + 1..];
+    }
+    result.push_str(rest);
+    result
+}
+
 /// Columns a Table node gives apart.
 const TABLE_COLUMNS: usize = 8;
 
@@ -415,6 +488,18 @@ pub const LIBRARY: &[Spec] = &[
         } },
     Spec { name: "To Radians", category: "Math", inputs: X, outputs: RESULT, eval: |a, _| f1(a, f64::to_radians) },
     Spec { name: "To Degrees", category: "Math", inputs: X, outputs: RESULT, eval: |a, _| f1(a, f64::to_degrees) },
+    Spec { name: "Expression", category: "Math",
+        inputs: &[s("expression", "a + b"), n("a", 0.0), n("b", 0.0), n("c", 0.0), n("d", 0.0), n("x", 0.0),
+            n("y", 0.0)],
+        outputs: RESULT,
+        eval: |a, _| {
+            let var = |name: &str| EXPRESSION_VARIABLES.iter().position(|v| *v == name).and_then(|k| num(&a[1 + k]));
+            out(match crate::expr::eval(&text(&a[0]), &var) {
+                Ok(crate::expr::Val::Bool(b)) => Value::Bool(b),
+                Ok(crate::expr::Val::Num(x)) if x.is_finite() => number(x),
+                _ => Value::Null,
+            })
+        } },
     Spec { name: "Pi", category: "Math", inputs: &[], outputs: RESULT, eval: |_, _| out(number(std::f64::consts::PI)) },
     Spec { name: "E", category: "Math", inputs: &[], outputs: RESULT, eval: |_, _| out(number(std::f64::consts::E)) },
     Spec { name: "Random", category: "Math", inputs: &[n("seed", 1.0), n("count", 10.0)], outputs: &["list"],
@@ -638,6 +723,60 @@ pub const LIBRARY: &[Spec] = &[
                     .collect())
             })
         } },
+    Spec { name: "Filter", category: "List", inputs: &[l("list"), s("condition", "x > 0")],
+        outputs: &["in", "out", "index"],
+        eval: |a, _| {
+            let items = list(&a[0]);
+            let condition = text(&a[1]);
+            let (mut kept, mut dropped, mut index) = (Vec::new(), Vec::new(), Vec::new());
+            for (k, item) in items.iter().enumerate() {
+                match item_test(&condition, item, k, items.len()) {
+                    Some(true) => {
+                        kept.push(item.clone());
+                        index.push(number(k as f64));
+                    }
+                    Some(false) => dropped.push(item.clone()),
+                    None => return vec![Value::Null; 3],
+                }
+            }
+            vec![Value::Array(kept), Value::Array(dropped), Value::Array(index)]
+        } },
+    Spec { name: "Sort By Key", category: "List", inputs: &[l("list"), l("keys"), b("descending", false)],
+        outputs: &["list", "keys", "index"],
+        eval: |a, _| {
+            let (items, keys) = (list(&a[0]), list(&a[1]));
+            let mut order: Vec<usize> = (0..items.len().min(keys.len())).collect();
+            order.sort_by(|i, j| compare(&keys[*i], &keys[*j]).unwrap_or(Ordering::Equal));
+            if boolean(&a[2]) == Some(true) {
+                order.reverse();
+            }
+            let pick = |from: &[Value]| Value::Array(order.iter().map(|k| from[*k].clone()).collect());
+            vec![pick(&items), pick(&keys), Value::Array(order.iter().map(|k| number(*k as f64)).collect())]
+        } },
+    Spec { name: "Repeat List", category: "List", inputs: &[l("list"), n("times", 2.0), n("length", 0.0)],
+        outputs: &["list"],
+        eval: |a, _| {
+            let items = list(&a[0]);
+            let length = num(&a[2]).unwrap_or(0.0).max(0.0) as usize;
+            let total = if length > 0 {
+                length
+            } else {
+                items.len().saturating_mul(num(&a[1]).unwrap_or(1.0).max(0.0) as usize)
+            };
+            out(Value::Array(if items.is_empty() {
+                Vec::new()
+            } else {
+                items.iter().cycle().take(total.min(MAX_ITEMS)).cloned().collect()
+            }))
+        } },
+    Spec { name: "Zip", category: "List", inputs: &[l("a"), l("b"), l("c"), l("d")], outputs: &["rows"],
+        eval: |a, _| {
+            let columns: Vec<Vec<Value>> = a.iter().filter(|value| !value.is_null()).map(list).collect();
+            let rows = columns.iter().map(Vec::len).min().unwrap_or(0);
+            out(Value::Array((0..rows)
+                .map(|k| Value::Array(columns.iter().map(|column| column[k].clone()).collect()))
+                .collect()))
+        } },
     // ── Text ─────────────────────────────────────────────────────────────
     Spec { name: "Concatenate", category: "Text", inputs: &[s("a", ""), s("b", "")], outputs: RESULT,
         eval: |a, _| out(Value::String(text(&a[0]) + &text(&a[1]))) },
@@ -693,7 +832,21 @@ pub const LIBRARY: &[Spec] = &[
             )),
             None => Value::Null,
         }) },
+    Spec { name: "Format Text", category: "Text",
+        inputs: &[s("template", "P-{a:00}"), v("a"), v("b"), v("c"), v("d")], outputs: RESULT,
+        eval: |a, _| out(Value::String(format_text(&text(&a[0]), &a[1..]))) },
     // ── Geometry ─────────────────────────────────────────────────────────
+    Spec { name: "Layer Objects", category: "Geometry", inputs: &[s("layer", "0"), s("type", "")],
+        outputs: &["objects", "curves", "count"],
+        eval: |a, host| {
+            let objects = host.layer_objects(text(&a[0]).trim(), text(&a[1]).trim());
+            let curves: Vec<Value> = objects
+                .iter()
+                .filter_map(|object| host.curve(object).as_ref().and_then(curve_value))
+                .collect();
+            let count = number(objects.len() as f64);
+            vec![Value::Array(objects), Value::Array(curves), count]
+        } },
     Spec { name: "Point", category: "Geometry", inputs: &[n("x", 0.0), n("y", 0.0), n("z", 0.0)], outputs: POINT,
         eval: |a, _| out(match (num(&a[0]), num(&a[1]), num(&a[2])) {
             (Some(x), Some(y), Some(z)) => point_value([x, y, z]),
@@ -1239,6 +1392,40 @@ mod tests {
         let pick = run("Choose", &[json!(1.0), json!("simple"), json!([1, 2]), json!(null), json!(null), json!(null)]);
         assert_eq!(pick[0], json!([1, 2]));
         assert_eq!(run("Choose", &[json!(7.0), json!(1), json!(2), json!(3), json!(4), json!(5)])[0], Value::Null);
+    }
+
+    #[test]
+    fn expressions_filters_keys_and_templates() {
+        let expression = |source: &str| {
+            run("Expression", &[json!(source), json!(2), json!(3), json!(0), json!(0), json!(10), json!(0)])[0].clone()
+        };
+        assert_eq!(expression("a * x + b"), json!(23.0));
+        assert_eq!(expression("x > a"), json!(true));
+        assert_eq!(expression("a +"), Value::Null);
+
+        let filtered = run("Filter", &[json!([1, 5, 2, 8]), json!("x > 2")]);
+        assert_eq!(filtered, vec![json!([5, 8]), json!([1, 2]), json!([1.0, 3.0])]);
+        let even = run("Filter", &[json!(["a", "b", "c"]), json!("i % 2 == 0")]);
+        assert_eq!(even[0], json!(["a", "c"]));
+        let high = run("Filter", &[json!([p(0.0, 1.0), p(0.0, 5.0)]), json!("py > 2")]);
+        assert_eq!(high[0], json!([p(0.0, 5.0)]));
+
+        let sorted = run("Sort By Key", &[json!(["c", "a", "b"]), json!([3, 1, 2]), json!(true)]);
+        assert_eq!(sorted, vec![json!(["c", "b", "a"]), json!([3, 2, 1]), json!([0.0, 2.0, 1.0])]);
+        assert_eq!(run("Repeat List", &[json!([1, 2]), json!(2), json!(0)])[0], json!([1, 2, 1, 2]));
+        assert_eq!(run("Repeat List", &[json!([1, 2]), json!(0), json!(5)])[0], json!([1, 2, 1, 2, 1]));
+        assert_eq!(
+            run("Zip", &[json!([1, 2, 3]), json!(["x", "y"]), json!(null), json!(null)])[0],
+            json!([[1, "x"], [2, "y"]])
+        );
+
+        let format = |template: &str, a: Value| {
+            run("Format Text", &[json!(template), a, json!("B"), json!(null), json!(null)])[0].clone()
+        };
+        assert_eq!(format("P-{a:00}", json!(3)), json!("P-03"));
+        assert_eq!(format("{a:.2} m", json!(2.5)), json!("2.50 m"));
+        assert_eq!(format("{b}{a:000.0} {{x}} {z}", json!(7)), json!("B007.0 {x} {z}"));
+        assert_eq!(format("{a:00}", json!("door")), json!("door"));
     }
 
     #[test]

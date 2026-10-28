@@ -8,6 +8,7 @@
 
 pub mod composite;
 pub mod docs;
+pub mod expr;
 pub mod geometry;
 pub mod ops;
 pub mod value;
@@ -38,6 +39,13 @@ pub trait Host {
 
     /// Evaluates an arithmetic expression.
     fn expression(&self, text: &str) -> Option<f64>;
+
+    /// The drawn objects on `layer` (every layer when empty), of the object
+    /// type `kind` when it names one, as object values. Objects the graph
+    /// itself draws are left out, so a graph never reads its own output.
+    fn layer_objects(&self, _layer: &str, _kind: &str) -> Vec<Value> {
+        Vec::new()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
