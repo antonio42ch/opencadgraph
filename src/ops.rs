@@ -892,7 +892,7 @@ pub const LIBRARY: &[Spec] = &[
         } },
     // ── Text ─────────────────────────────────────────────────────────────
     Spec { name: "Concatenate", category: "Text", inputs: &[s("a", ""), s("b", "")], outputs: RESULT,
-        eval: |a, _| out(Value::String(text(&a[0]) + &text(&a[1]))) },
+        eval: |a, _| out(Value::String(text(&a[0]) + text(&a[1]).as_str())) },
     Spec { name: "Text Length", category: "Text", inputs: TEXT, outputs: RESULT,
         eval: |a, _| out(number(text(&a[0]).chars().count() as f64)) },
     Spec { name: "Upper Case", category: "Text", inputs: TEXT, outputs: RESULT,

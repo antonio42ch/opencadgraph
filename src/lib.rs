@@ -12,6 +12,7 @@ pub mod expr;
 pub mod geometry;
 pub mod ops;
 pub mod profile;
+pub mod script;
 pub mod value;
 
 use std::collections::BTreeMap;
@@ -85,6 +86,8 @@ pub enum Kind {
     Object(String),
     /// A graph of operations used as one node.
     Composite(std::sync::Arc<Composite>),
+    /// A short program with the ports its header declares.
+    Script(std::sync::Arc<script::Script>),
 }
 
 #[derive(Clone, Debug)]
@@ -116,6 +119,8 @@ pub enum Issue {
     Inner(String, Box<Issue>),
     /// The formula or condition the node reads does not read: why.
     Formula(String),
+    /// A script did not read or stopped: why, with its line.
+    Script(String),
 }
 
 impl Issue {
@@ -127,6 +132,7 @@ impl Issue {
             Issue::NoResult => "No result with these values".to_owned(),
             Issue::Inner(step, issue) => format!("{step}: {}", issue.message()),
             Issue::Formula(why) => format!("The formula does not read: {why}"),
+            Issue::Script(why) => format!("Script: {why}"),
         }
     }
 }
@@ -138,6 +144,20 @@ fn holds_object(value: &Value) -> bool {
         Value::Array(items) => items.iter().any(holds_object),
         Value::Object(object) => object.contains_key("handle"),
         _ => false,
+    }
+}
+
+/// `value` with every drawn object the host can read a curve from replaced
+/// by that curve.
+fn resolve_objects(value: Value, host: &dyn Host) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(items.into_iter().map(|item| resolve_objects(item, host)).collect()),
+        Value::Object(ref object) if object.contains_key("handle") => host
+            .curve(&value)
+            .as_ref()
+            .and_then(value::curve_value)
+            .unwrap_or(value),
+        other => other,
     }
 }
 
@@ -198,6 +218,7 @@ impl Graph {
                 .collect(),
             Kind::Object(_) => BTreeMap::new(),
             Kind::Composite(composite) => composite.defaults(),
+            Kind::Script(script) => script.defaults(),
         };
         self.nodes.push(Node {
             id: self.next_id,
@@ -318,6 +339,7 @@ impl Graph {
                     Kind::Op(spec) => json!({ "op": spec.name }),
                     Kind::Object(name) => json!({ "object": name }),
                     Kind::Composite(composite) => json!({ "composite": composite.to_json() }),
+                    Kind::Script(script) => json!({ "script": script.to_json() }),
                 },
                 "params": node.params,
             })).collect::<Vec<_>>(),
@@ -345,6 +367,8 @@ impl Graph {
                 Kind::Object(name.to_owned())
             } else if node["kind"]["composite"].is_object() {
                 Kind::Composite(std::sync::Arc::new(Composite::from_json(&node["kind"]["composite"])?))
+            } else if node["kind"]["script"].is_object() {
+                Kind::Script(script::Script::from_json(&node["kind"]["script"])?)
             } else {
                 return Err(format!("node {id} has no kind"));
             };
@@ -412,6 +436,21 @@ impl Graph {
                     }
                     let (outputs, issues) = composite.evaluate_checked(&inputs, host);
                     (outputs, issues, key)
+                }
+                Kind::Script(script) => {
+                    // Drawn objects reach a script as the curves they hold.
+                    let args: Vec<Value> = script
+                        .inputs
+                        .iter()
+                        .map(|port| resolve_objects(self.input(&Port { node: id, field: port.name.clone() }), host))
+                        .collect();
+                    let key = Some(memo_key(&script.source, 1, &args));
+                    if key == memo && !args.iter().any(holds_object) {
+                        continue;
+                    }
+                    let (values, failure) = script.evaluate(&args);
+                    let outputs = script.outputs.iter().map(|port| port.name.clone()).zip(values).collect();
+                    (outputs, failure.map(Issue::Script).into_iter().collect(), key)
                 }
             };
             if let Some(node) = self.node_mut(id) {

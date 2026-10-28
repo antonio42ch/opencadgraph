@@ -45,7 +45,7 @@ impl Type {
         }
     }
 
-    fn parse(name: &str) -> Option<Self> {
+    pub(crate) fn parse(name: &str) -> Option<Self> {
         [
             Type::Any,
             Type::Number,

@@ -37,6 +37,7 @@ impl Composite {
         self.graph.nodes.iter().all(|node| match &node.kind {
             crate::Kind::Op(spec) => crate::ops::is_pure(spec.name),
             crate::Kind::Composite(inner) => inner.is_pure(),
+            crate::Kind::Script(_) => true,
             crate::Kind::Object(_) => false,
         })
     }
@@ -119,6 +120,7 @@ impl Composite {
                 let step = match &node.kind {
                     Kind::Op(spec) => spec.name.to_owned(),
                     Kind::Composite(composite) => composite.name.clone(),
+                    Kind::Script(script) => script.name.clone(),
                     Kind::Object(name) => name.clone(),
                 };
                 node.issues

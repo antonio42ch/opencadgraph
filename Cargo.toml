@@ -11,3 +11,9 @@ categories = ["graphics"]
 [dependencies]
 serde_json = "1"
 kernel = { package = "opencadkernel", git = "https://github.com/HakanSeven12/opencadkernel.git", rev = "3ee4d3b", features = ["offset"] }
+# Script nodes: a sandboxed Rhai engine, with no clock so it builds for the web.
+rhai = { version = "=1.20.1", optional = true, default-features = false, features = ["std", "sync", "serde", "no_time", "no_module", "no_custom_syntax"] }
+
+[features]
+default = ["script"]
+script = ["dep:rhai"]
