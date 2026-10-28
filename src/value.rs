@@ -34,11 +34,16 @@ pub fn boolean(value: &Value) -> Option<bool> {
     }
 }
 
-/// Display text: strings as they are, `null` empty, anything else as JSON.
+/// Display text: strings as they are, `null` empty, whole numbers without a
+/// decimal point, anything else as JSON.
 pub fn text(value: &Value) -> String {
     match value {
         Value::String(s) => s.clone(),
         Value::Null => String::new(),
+        Value::Number(n) => match n.as_f64() {
+            Some(x) if x.fract() == 0.0 && x.abs() < 1e15 => format!("{}", x as i64),
+            _ => n.to_string(),
+        },
         other => other.to_string(),
     }
 }

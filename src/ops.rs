@@ -250,6 +250,73 @@ fn format_text(template: &str, values: &[Value]) -> String {
     result
 }
 
+/// A Table's outputs from its cells: its columns, rows and row count, the
+/// first row left out when `header` is on.
+fn table_outputs(cells: &Value, header: &Value) -> Vec<Value> {
+    let mut rows = crate::value::table(cells);
+    if boolean(header).unwrap_or(true) && !rows.is_empty() {
+        rows.remove(0);
+    }
+    let mut outputs: Vec<Value> = (0..TABLE_COLUMNS)
+        .map(|k| Value::Array(rows.iter().map(|row| row.get(k).cloned().unwrap_or(Value::Null)).collect()))
+        .collect();
+    outputs.push(number(rows.len() as f64));
+    outputs.insert(TABLE_COLUMNS, Value::Array(rows.into_iter().map(Value::Array).collect()));
+    outputs
+}
+
+/// Why the formula of an Expression or the condition of a Filter does not
+/// read, if it does not.
+pub(crate) fn formula_issue(spec: &Spec, args: &[Value]) -> Option<String> {
+    let (source, names): (&Value, &[&str]) = match spec.name {
+        "Expression" => (args.first()?, EXPRESSION_VARIABLES),
+        "Filter" => (args.get(1)?, FILTER_VARIABLES),
+        _ => return None,
+    };
+    let var = |name: &str| names.contains(&name).then_some(1.0);
+    crate::expr::eval(&text(source), &var).err()
+}
+
+/// The names a Filter condition reads.
+const FILTER_VARIABLES: &[&str] = &["x", "i", "n", "px", "py", "pz", "length"];
+
+/// Linear interpolation of `y` at `x` over the points `(xs, ys)`, sorted by
+/// x; beyond the ends the end values hold.
+fn interpolate(xs: &[f64], ys: &[f64], x: f64) -> Option<f64> {
+    let mut points: Vec<(f64, f64)> = xs.iter().copied().zip(ys.iter().copied()).collect();
+    points.sort_by(|p, q| p.0.total_cmp(&q.0));
+    let (first, last) = (points.first()?, points.last()?);
+    if x <= first.0 {
+        return Some(first.1);
+    }
+    if x >= last.0 {
+        return Some(last.1);
+    }
+    let k = points.partition_point(|p| p.0 <= x);
+    let ((x0, y0), (x1, y1)) = (points[k - 1], points[k]);
+    Some(if x1 > x0 { y0 + (y1 - y0) * (x - x0) / (x1 - x0) } else { y1 })
+}
+
+/// Rows as CSV text, cells joined by `separator` and quoted when they hold
+/// it, a quote or a line break.
+fn csv_text(rows: &[Value], separator: &str) -> String {
+    let cell = |value: &Value| {
+        let text = text(value);
+        if text.contains(separator) || text.contains(['"', '\n', '\r']) {
+            format!("\"{}\"", text.replace('"', "\"\""))
+        } else {
+            text
+        }
+    };
+    rows.iter()
+        .map(|row| match row {
+            Value::Array(cells) => cells.iter().map(cell).collect::<Vec<_>>().join(separator),
+            other => cell(other),
+        })
+        .map(|line| line + "\n")
+        .collect()
+}
+
 /// Columns a Table node gives apart.
 const TABLE_COLUMNS: usize = 8;
 
@@ -435,18 +502,7 @@ pub const LIBRARY: &[Spec] = &[
     Spec { name: "Table", category: "Input", inputs: &[l("table"), b("header", true)],
         outputs: &["column 1", "column 2", "column 3", "column 4", "column 5", "column 6", "column 7", "column 8",
             "rows", "count"],
-        eval: |a, _| {
-            let mut rows = crate::value::table(&a[0]);
-            if boolean(&a[1]).unwrap_or(true) && !rows.is_empty() {
-                rows.remove(0);
-            }
-            let mut outputs: Vec<Value> = (0..TABLE_COLUMNS)
-                .map(|k| Value::Array(rows.iter().map(|row| row.get(k).cloned().unwrap_or(Value::Null)).collect()))
-                .collect();
-            outputs.push(number(rows.len() as f64));
-            outputs.insert(TABLE_COLUMNS, Value::Array(rows.into_iter().map(Value::Array).collect()));
-            outputs
-        } },
+        eval: |a, _| table_outputs(&a[0], &a[1]) },
     // ── Math ─────────────────────────────────────────────────────────────
     Spec { name: "Add", category: "Math", inputs: AB, outputs: RESULT, eval: |a, _| f2(a, |x, y| x + y) },
     Spec { name: "Subtract", category: "Math", inputs: AB, outputs: RESULT, eval: |a, _| f2(a, |x, y| x - y) },
@@ -500,6 +556,11 @@ pub const LIBRARY: &[Spec] = &[
                 _ => Value::Null,
             })
         } },
+    Spec { name: "Interpolate Values", category: "Math", inputs: &[l("x list"), l("y list"), n("x", 0.0)],
+        outputs: &["y"],
+        eval: |a, _| out(num(&a[2])
+            .and_then(|x| interpolate(&numbers(&a[0]), &numbers(&a[1]), x))
+            .map_or(Value::Null, number)) },
     Spec { name: "Pi", category: "Math", inputs: &[], outputs: RESULT, eval: |_, _| out(number(std::f64::consts::PI)) },
     Spec { name: "E", category: "Math", inputs: &[], outputs: RESULT, eval: |_, _| out(number(std::f64::consts::E)) },
     Spec { name: "Random", category: "Math", inputs: &[n("seed", 1.0), n("count", 10.0)], outputs: &["list"],
@@ -741,6 +802,26 @@ pub const LIBRARY: &[Spec] = &[
             }
             vec![Value::Array(kept), Value::Array(dropped), Value::Array(index)]
         } },
+    Spec { name: "Group By", category: "List", inputs: &[l("keys"), l("values")],
+        outputs: &["keys", "sums", "counts", "groups"],
+        eval: |a, _| {
+            let (keys, values) = (list(&a[0]), list(&a[1]));
+            let mut groups: Vec<(Value, Vec<Value>)> = Vec::new();
+            for (key, value) in keys.into_iter().zip(values) {
+                match groups.iter_mut().find(|(seen, _)| equal(seen, &key)) {
+                    Some((_, members)) => members.push(value),
+                    None => groups.push((key, vec![value])),
+                }
+            }
+            vec![
+                Value::Array(groups.iter().map(|(key, _)| key.clone()).collect()),
+                Value::Array(groups.iter()
+                    .map(|(_, members)| number(members.iter().filter_map(num).sum()))
+                    .collect()),
+                Value::Array(groups.iter().map(|(_, members)| number(members.len() as f64)).collect()),
+                Value::Array(groups.into_iter().map(|(_, members)| Value::Array(members)).collect()),
+            ]
+        } },
     Spec { name: "Sort By Key", category: "List", inputs: &[l("list"), l("keys"), b("descending", false)],
         outputs: &["list", "keys", "index"],
         eval: |a, _| {
@@ -832,6 +913,25 @@ pub const LIBRARY: &[Spec] = &[
             )),
             None => Value::Null,
         }) },
+    Spec { name: "Read CSV", category: "Text", inputs: &[s("path", ""), b("header", true)],
+        outputs: &["column 1", "column 2", "column 3", "column 4", "column 5", "column 6", "column 7", "column 8",
+            "rows", "count"],
+        eval: |a, host| match host.read_file(text(&a[0]).trim()) {
+            Some(file) => table_outputs(&Value::String(file), &a[1]),
+            None => vec![Value::Null; TABLE_COLUMNS + 2],
+        } },
+    Spec { name: "Write CSV", category: "Text", inputs: &[l("rows"), s("path", ""), s("separator", ",")],
+        outputs: &["text", "written"],
+        eval: |a, host| {
+            let separator = match text(&a[2]) {
+                separator if separator.is_empty() => ",".to_owned(),
+                separator => separator,
+            };
+            let csv = csv_text(&list(&a[0]), &separator);
+            let path = text(&a[1]);
+            let written = !path.trim().is_empty() && host.write_file(path.trim(), &csv);
+            vec![Value::String(csv), Value::Bool(written)]
+        } },
     Spec { name: "Format Text", category: "Text",
         inputs: &[s("template", "P-{a:00}"), v("a"), v("b"), v("c"), v("d")], outputs: RESULT,
         eval: |a, _| out(Value::String(format_text(&text(&a[0]), &a[1..]))) },
@@ -847,6 +947,8 @@ pub const LIBRARY: &[Spec] = &[
             let count = number(objects.len() as f64);
             vec![Value::Array(objects), Value::Array(curves), count]
         } },
+    Spec { name: "Object Data", category: "Geometry", inputs: &[v("object"), s("key", "")], outputs: VALUE,
+        eval: |a, host| out(host.object_data(&a[0], text(&a[1]).trim())) },
     Spec { name: "Point", category: "Geometry", inputs: &[n("x", 0.0), n("y", 0.0), n("z", 0.0)], outputs: POINT,
         eval: |a, _| out(match (num(&a[0]), num(&a[1]), num(&a[2])) {
             (Some(x), Some(y), Some(z)) => point_value([x, y, z]),
@@ -1205,6 +1307,26 @@ pub const LIBRARY: &[Spec] = &[
             let radius = num(&a[1]).unwrap_or(0.0);
             out(edit(&a[0], host, |shape| g::fillet(shape, radius)))
         } },
+    Spec { name: "Distance Along Curve", category: "Curve", inputs: &[v("curve"), v("point")],
+        outputs: &["distance", "offset", "point", "angle"],
+        eval: |a, host| match (curve_of(&a[0], host), point(&a[1])) {
+            (Some(c), Some(p)) => match c.plane.project(p) {
+                Some(uv) => {
+                    let found = kernel::geom2d::closest_point(&c.curve, uv);
+                    match g::curve_frame(&c, found.t) {
+                        Some(frame) => vec![
+                            number(c.curve.length_to(found.t)),
+                            number(g::dot(g::sub(p, frame.origin), frame.y_axis)),
+                            point_value(frame.origin),
+                            number(frame.x_axis[1].atan2(frame.x_axis[0]).to_degrees()),
+                        ],
+                        None => vec![Value::Null; 4],
+                    }
+                }
+                None => vec![Value::Null; 4],
+            },
+            _ => vec![Value::Null; 4],
+        } },
     Spec { name: "Closest Point", category: "Curve", inputs: &[v("curve"), v("point")],
         outputs: &["point", "t", "distance"],
         eval: |a, host| match (curve_of(&a[0], host), point(&a[1])) {
@@ -1426,6 +1548,36 @@ mod tests {
         assert_eq!(format("{a:.2} m", json!(2.5)), json!("2.50 m"));
         assert_eq!(format("{b}{a:000.0} {{x}} {z}", json!(7)), json!("B007.0 {x} {z}"));
         assert_eq!(format("{a:00}", json!("door")), json!("door"));
+    }
+
+    #[test]
+    fn profiles_groups_csv_and_formula_issues() {
+        let profile = |x: f64| run("Interpolate Values", &[json!([0, 20, 40]), json!([100, 104, 102]), json!(x)])[0].clone();
+        assert_eq!(profile(10.0), json!(102.0));
+        assert_eq!(profile(30.0), json!(103.0));
+        assert_eq!(profile(-5.0), json!(100.0));
+        assert_eq!(profile(99.0), json!(102.0));
+
+        let path = run("Polyline Curve", &[json!([p(0.0, 0.0), p(10.0, 0.0), p(10.0, 10.0)]), json!(false)]).remove(0);
+        let along = run("Distance Along Curve", &[path, p(12.0, 4.0)]);
+        assert!((num(&along[0]).unwrap() - 14.0).abs() < 1e-9, "{along:?}");
+        assert!((num(&along[1]).unwrap() + 2.0).abs() < 1e-9, "right of the curve");
+        let foot = point(&along[2]).unwrap();
+        assert!((foot[0] - 10.0).abs() < 1e-9 && (foot[1] - 4.0).abs() < 1e-9);
+        assert!((num(&along[3]).unwrap() - 90.0).abs() < 1e-9);
+
+        let grouped = run("Group By", &[json!(["A", "B", "A"]), json!([2, 3, 4.5])]);
+        assert_eq!(grouped, vec![json!(["A", "B"]), json!([6.5, 3.0]), json!([2.0, 1.0]), json!([[2, 4.5], [3]])]);
+
+        let csv = run("Write CSV", &[json!([["name", "area"], ["Room, 1", 12.5]]), json!(""), json!(",")]);
+        assert_eq!(csv, vec![json!("name,area\n\"Room, 1\",12.5\n"), json!(false)]);
+        assert_eq!(run("Read CSV", &[json!("x.csv"), json!(true)])[9], Value::Null, "no host file");
+
+        let issue = formula_issue(spec("Expression").unwrap(), &[json!("a +"), json!(0)]);
+        assert!(issue.is_some_and(|why| why.contains("too soon")));
+        let unknown = formula_issue(spec("Filter").unwrap(), &[json!([]), json!("q > 1")]);
+        assert_eq!(unknown.as_deref(), Some("unknown name `q`"));
+        assert_eq!(formula_issue(spec("Filter").unwrap(), &[json!([]), json!("x > i")]), None);
     }
 
     #[test]

@@ -174,6 +174,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("To Radians", "number -> number", "Converts degrees to radians."),
     ("To Degrees", "number -> number", "Converts radians to degrees."),
     ("Expression", "text, number*6 -> any", "Evaluates a formula of a, b, c, d, x and y with + - * / % ^, comparisons (< <= > >= == !=), and, or, not, c ? a : b, and functions such as sqrt, sin, min, max, round, clamp or if. Comparisons give true or false."),
+    ("Interpolate Values", "number[]*2, number -> number", "Reads a value off a table of points by straight lines between them: the y at an x, such as the elevation at a station from the stations and elevations of a profile. Beyond the ends, the end values hold."),
     ("Pi", " -> number", "The number π."),
     ("E", " -> number", "The number e."),
     ("Random", "number*2 -> number[]", "A list of random numbers from 0 to 1; the same seed gives the same list."),
@@ -225,6 +226,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("Sort By Key", "any[]*2, bool -> any[]*2, number[]", "Sorts a list by a parallel list of keys, such as curves by their lengths: the sorted list, the sorted keys and the original index of each item."),
     ("Repeat List", "any[], number*2 -> any[]", "The whole list repeated a number of times, or cycled until it has length items."),
     ("Zip", "any[]*4 -> any[]", "Joins up to four lists item by item into rows: [a0, b0, …], [a1, b1, …]. Stops at the shortest list."),
+    ("Group By", "any[]*2 -> any[], number[]*2, any[]", "Gathers values by their keys, such as lengths by layer or areas by kind: each key once, the sum and count of its values, and the values of each key."),
     // ── Text ─────────────────────────────────────────────────────────────
     ("Concatenate", "text*2 -> text", "Text a followed by text b. Lists join item by item."),
     ("Text Length", "text -> number", "How many characters the text has."),
@@ -239,9 +241,12 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("To Text", "any -> text", "Writes the whole value, a list included, as one text."),
     ("Format Number", "number*4, text*2 -> text", "Writes a number with fixed decimals, at least digits integer digits, and the digits in groups joined by a separator: 1,234.50 or the station 0+030.00 (4 digits, groups of 3, separator +)."),
     ("Format Text", "text, any*4 -> text", "Fills a template with values: {a} to {d} are replaced by the inputs, and {a:000} pads a number to three digits, {a:.2} rounds it to two decimals. P-{a:00} gives P-01, P-02… for a list of numbers."),
+    ("Read CSV", "text, bool -> any[]*9, number", "Reads a CSV or text table file, its path relative to the drawing's folder, read again each time the graph runs: each column as a list, the rows and their count, as a Table gives them."),
+    ("Write CSV", "any[], text*2 -> text, bool", "Writes rows (lists of cells) as CSV text and, when a path is given, to that .csv or .txt file next to the drawing; whether it was written."),
     // ── Geometry ─────────────────────────────────────────────────────────
     ("Point", "number*3 -> point", "A point from its x, y and z coordinates."),
     ("Layer Objects", "text*2 -> object[], curve[], number", "The drawn objects on a layer, of a type such as Line or Circle when one is given, read again each time the graph runs: the objects, their curves and how many there are. Objects the graph draws itself are left out."),
+    ("Object Data", "object, text -> any", "The data value an object carries under a key, as Tag Objects or a drawing node writes it; with no key, all of its data as key=value texts."),
     ("Point Components", "point -> number*3", "The x, y and z coordinates of a point."),
     ("Distance", "point*2 -> number", "The distance between two points."),
     ("Midpoint", "point*2 -> point", "The point halfway between two points."),
@@ -282,6 +287,7 @@ const TABLE: &[(&str, &str, &str)] = &[
     ("Region Intersection", "curve[]*2 -> curve[], number", "What the closed curves of a and of b both cover, as regions (each its outline and its holes), and its area."),
     ("Sub Curve", "curve, number*2 -> curve", "The part of a curve between two distances along it."),
     ("Split At Distances", "curve, number[] -> curve[]*3", "Cuts a curve at distances along it: every piece, and the even (1st, 3rd…) and odd (2nd, 4th…) pieces apart, such as wall stretches and openings."),
+    ("Distance Along Curve", "curve, point -> number*2, point, number", "Where a point stands along a curve: the distance along it to the closest point (a station), the offset to its left (negative to its right), that closest point and the curve's angle there."),
     ("Closest Point", "curve, point -> point, number*2", "The point of a curve nearest to a point, its parameter t and the distance to it."),
     // ── Vector ───────────────────────────────────────────────────────────
     ("Vector", "number*3 -> vector", "A vector from its x, y and z components."),

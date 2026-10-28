@@ -46,6 +46,23 @@ pub trait Host {
     fn layer_objects(&self, _layer: &str, _kind: &str) -> Vec<Value> {
         Vec::new()
     }
+
+    /// The data value `key` an object carries; with an empty key, all of
+    /// its data as `key=value` texts. Null when it carries none.
+    fn object_data(&self, _object: &Value, _key: &str) -> Value {
+        Value::Null
+    }
+
+    /// The text of the file at `path`, relative to the drawing's folder.
+    fn read_file(&self, _path: &str) -> Option<String> {
+        None
+    }
+
+    /// Writes `text` to the file at `path` unless it already holds it;
+    /// whether the file now holds it. Hosts may refuse some paths.
+    fn write_file(&self, _path: &str, _text: &str) -> bool {
+        false
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -93,6 +110,8 @@ pub enum Issue {
     NoResult,
     /// A step inside a composite, by its operation's name, has an issue.
     Inner(String, Box<Issue>),
+    /// The formula or condition the node reads does not read: why.
+    Formula(String),
 }
 
 impl Issue {
@@ -103,6 +122,7 @@ impl Issue {
             Issue::EmptyList(input) => format!("The list on {input} is empty"),
             Issue::NoResult => "No result with these values".to_owned(),
             Issue::Inner(step, issue) => format!("{step}: {}", issue.message()),
+            Issue::Formula(why) => format!("The formula does not read: {why}"),
         }
     }
 }
@@ -112,6 +132,9 @@ pub(crate) const MAX_ISSUES: usize = 4;
 
 /// Why `spec` gave nothing for `args`.
 fn diagnose(spec: &Spec, args: &[Value]) -> Issue {
+    if let Some(why) = ops::formula_issue(spec, args) {
+        return Issue::Formula(why);
+    }
     for (input, arg) in spec.inputs.iter().zip(args) {
         let empty = match arg {
             Value::Null => true,
