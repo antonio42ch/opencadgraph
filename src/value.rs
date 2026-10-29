@@ -288,30 +288,6 @@ pub fn plane_at(z: f64) -> Plane {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn curves_round_trip_through_their_values() {
-        for value in [
-            json!({"curve":"line","start":[0.0,0.0],"end":[10.0,0.0]}),
-            json!({"curve":"circle","center":[1.0,2.0],"radius":3.0}),
-            json!({"curve":"arc","center":[0.0,0.0],"radius":2.0,"from":0.0,"to":90.0}),
-            json!({"curve":"polyline","points":[[0.0,0.0],[5.0,0.0],[5.0,5.0]],"closed":true}),
-            json!({"curve":"line","start":[0.0,0.0],"end":[1.0,0.0],"plane":{"origin":[0.0,0.0,4.0],"x_axis":[1.0,0.0,0.0],"y_axis":[0.0,1.0,0.0]}}),
-        ] {
-            let curve = curve(&value).unwrap_or_else(|| panic!("{value}"));
-            assert_eq!(curve_value(&curve).unwrap(), value);
-        }
-        let arc =
-            curve(&json!({"curve":"arc","center":[0,0],"radius":2,"from":0,"to":90})).unwrap();
-        assert!((arc.length() - std::f64::consts::PI).abs() < 1e-9);
-        assert!(curve(&json!({"curve":"circle","center":[0,0],"radius":-1})).is_none());
-        assert!(curve(&json!({"x":1,"y":2})).is_none());
-    }
-}
-
 /// A table's rows: a list of lists, or text with a row per line and cells
 /// split by tabs, semicolons or commas (the first of them the text holds).
 /// Cells that read as numbers become numbers.
@@ -339,5 +315,29 @@ pub fn table(value: &Value) -> Vec<Vec<Value>> {
                 .collect()
         }
         _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn curves_round_trip_through_their_values() {
+        for value in [
+            json!({"curve":"line","start":[0.0,0.0],"end":[10.0,0.0]}),
+            json!({"curve":"circle","center":[1.0,2.0],"radius":3.0}),
+            json!({"curve":"arc","center":[0.0,0.0],"radius":2.0,"from":0.0,"to":90.0}),
+            json!({"curve":"polyline","points":[[0.0,0.0],[5.0,0.0],[5.0,5.0]],"closed":true}),
+            json!({"curve":"line","start":[0.0,0.0],"end":[1.0,0.0],"plane":{"origin":[0.0,0.0,4.0],"x_axis":[1.0,0.0,0.0],"y_axis":[0.0,1.0,0.0]}}),
+        ] {
+            let curve = curve(&value).unwrap_or_else(|| panic!("{value}"));
+            assert_eq!(curve_value(&curve).unwrap(), value);
+        }
+        let arc =
+            curve(&json!({"curve":"arc","center":[0,0],"radius":2,"from":0,"to":90})).unwrap();
+        assert!((arc.length() - std::f64::consts::PI).abs() < 1e-9);
+        assert!(curve(&json!({"curve":"circle","center":[0,0],"radius":-1})).is_none());
+        assert!(curve(&json!({"x":1,"y":2})).is_none());
     }
 }

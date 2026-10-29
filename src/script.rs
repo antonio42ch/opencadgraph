@@ -482,8 +482,8 @@ let line = line(a, b);
 "#;
         let (out, issue) = Script::new("S", source).evaluate(&[]);
         assert_eq!(issue, None);
-        for k in 0..4 {
-            assert!(crate::value::curve(&out[k]).is_some(), "output {k}: {}", out[k]);
+        for (k, curve) in out.iter().take(4).enumerate() {
+            assert!(crate::value::curve(curve).is_some(), "output {k}: {curve}");
         }
         assert_eq!(out[4], json!(5.0));
         assert_eq!(crate::value::point(&out[5]), Some([2.0, 1.5, 0.0]));

@@ -343,7 +343,7 @@ mod tests {
         assert_eq!(run("a < b && !(b == 4)"), Val::Bool(true));
         assert_eq!(run("a > b ? 10 : 20"), Val::Num(20.0));
         assert_eq!(run("if(a = 2, max(a, b, 9), 0)"), Val::Num(9.0));
-        assert_eq!(run("round(pi, 2)"), Val::Num(3.14));
+        assert_eq!(run("round(10.256, 1)"), Val::Num(10.3));
         assert_eq!(run("(a > 1) + (b > 1)"), Val::Num(2.0));
         assert_eq!(run("1.5e2"), Val::Num(150.0));
         assert!((run("sin(30)").num() - 0.5).abs() < 1e-12);

@@ -1579,7 +1579,7 @@ mod tests {
     fn both_sides_of_an_axis_close_into_an_outline() {
         let axis = run("Line Curve", &[p(0.0, 0.0), p(10.0, 0.0)]).remove(0);
         let sides = run("Offset Both Sides", &[axis, json!(0.2)]);
-        let area = |value: &Value| num(&run("Curve Area", &[value.clone()])[0]).unwrap();
+        let area = |value: &Value| num(&run("Curve Area", std::slice::from_ref(value))[0]).unwrap();
         assert!((area(&sides[0]) - 2.0).abs() < 1e-9, "{}", sides[0]);
         assert_eq!(sides[1]["start"], json!([0.0, 0.1]));
         assert_eq!(sides[2]["start"], json!([0.0, -0.1]));
@@ -1778,7 +1778,7 @@ mod tests {
     fn curves_made_as_values_feed_the_curve_operations() {
         let line = run("Line Curve", &[p(0.0, 0.0), p(3.0, 4.0)]).remove(0);
         assert_eq!(line["curve"], "line");
-        assert_eq!(run("Curve Length", &[line.clone()])[0], json!(5.0));
+        assert_eq!(run("Curve Length", std::slice::from_ref(&line))[0], json!(5.0));
         let ends = run("Curve Endpoints", &[line]);
         assert_eq!(point(&ends[1]), Some([3.0, 4.0, 0.0]));
 
@@ -1804,7 +1804,7 @@ mod tests {
         .remove(0);
         let outer = run("Offset Curve", &[square.clone(), json!(-1.0)]).remove(0);
         let inner = run("Offset Curve", &[square, json!(1.0)]).remove(0);
-        let area = |value: &Value| num(&run("Curve Area", &[value.clone()])[0]).unwrap();
+        let area = |value: &Value| num(&run("Curve Area", std::slice::from_ref(value))[0]).unwrap();
         assert!(area(&outer) > 100.0 && area(&inner) < 100.0, "{outer} {inner}");
         assert!((area(&inner) - 64.0).abs() < 1e-6);
     }
@@ -1815,7 +1815,7 @@ mod tests {
     }
 
     fn length_of(value: &Value) -> f64 {
-        num(&run("Curve Length", &[value.clone()])[0]).unwrap()
+        num(&run("Curve Length", std::slice::from_ref(value))[0]).unwrap()
     }
 
     #[test]
@@ -1882,7 +1882,7 @@ mod tests {
     #[test]
     fn nested_lists_reshape() {
         let items = json!([1, 2, 3]);
-        assert_eq!(run("Graft", &[items.clone()])[0], json!([[1], [2], [3]]));
+        assert_eq!(run("Graft", std::slice::from_ref(&items))[0], json!([[1], [2], [3]]));
         assert_eq!(run("Flatten Once", &[json!([[1, [2]], [3]])])[0], json!([1, [2], 3]));
         assert_eq!(run("List Depth", &[json!([[1], [2, [3]]])])[0], json!(3.0));
         let crossed = run("Cross Reference", &[json!(["a", "b"]), json!([1, 2])]);
